@@ -1062,11 +1062,20 @@ elif menu == "🔥 Priority Matrix":
             fig.add_shape(type="line", x0=0.5, y0=1.5, x1=3.5, y1=1.5, line=dict(color="#cbd5e1", width=1.5, dash="dash"))
             fig.add_shape(type="line", x0=0.5, y0=2.5, x1=3.5, y1=2.5, line=dict(color="#cbd5e1", width=1.5, dash="dash"))
             
-            # Quadrant Labels (Annotations)
-            fig.add_annotation(x=1.0, y=3.4, text="🏛️ High Legal Impact", showarrow=False, font=dict(size=11, color="#475569", weight="bold"), bgcolor="rgba(241,245,249,0.9)", bordercolor="#cbd5e1", borderwidth=1, borderpad=4)
-            fig.add_annotation(x=3.0, y=3.4, text="🚨 Critical Priority", showarrow=False, font=dict(size=11, color="#991b1b", weight="bold"), bgcolor="rgba(254,242,242,0.9)", bordercolor="#fecaca", borderwidth=1, borderpad=4)
-            fig.add_annotation(x=1.0, y=0.6, text="📋 Routine Cases", showarrow=False, font=dict(size=11, color="#166534", weight="bold"), bgcolor="rgba(240,253,244,0.9)", bordercolor="#bbf7d0", borderwidth=1, borderpad=4)
-            fig.add_annotation(x=3.0, y=0.6, text="⚡ Operational Urgency", showarrow=False, font=dict(size=11, color="#c2410c", weight="bold"), bgcolor="rgba(255,247,237,0.9)", bordercolor="#fed7aa", borderwidth=1, borderpad=4)
+            # Quadrant Labels (Annotations - Displayed conditionally only if at least one case exists in that quadrant)
+            has_top_left = any(item["Urgency Score"] < 70 and item["Complexity Score"] >= 40 for item in matrix_data)
+            has_top_right = any(item["Urgency Score"] >= 70 and item["Complexity Score"] >= 40 for item in matrix_data)
+            has_bottom_left = any(item["Urgency Score"] < 70 and item["Complexity Score"] < 40 for item in matrix_data)
+            has_bottom_right = any(item["Urgency Score"] >= 70 and item["Complexity Score"] < 40 for item in matrix_data)
+
+            if has_top_left:
+                fig.add_annotation(x=1.0, y=3.4, text="🏛️ High Legal Impact", showarrow=False, font=dict(size=11, color="#475569", weight="bold"), bgcolor="rgba(241,245,249,0.9)", bordercolor="#cbd5e1", borderwidth=1, borderpad=4)
+            if has_top_right:
+                fig.add_annotation(x=3.0, y=3.4, text="🚨 Critical Priority", showarrow=False, font=dict(size=11, color="#991b1b", weight="bold"), bgcolor="rgba(254,242,242,0.9)", bordercolor="#fecaca", borderwidth=1, borderpad=4)
+            if has_bottom_left:
+                fig.add_annotation(x=1.0, y=0.6, text="📋 Routine Cases", showarrow=False, font=dict(size=11, color="#166534", weight="bold"), bgcolor="rgba(240,253,244,0.9)", bordercolor="#bbf7d0", borderwidth=1, borderpad=4)
+            if has_bottom_right:
+                fig.add_annotation(x=3.0, y=0.6, text="⚡ Operational Urgency", showarrow=False, font=dict(size=11, color="#c2410c", weight="bold"), bgcolor="rgba(255,247,237,0.9)", bordercolor="#fed7aa", borderwidth=1, borderpad=4)
             
             colors_map = {
                 'High': '#dc2626',
