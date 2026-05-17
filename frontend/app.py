@@ -311,9 +311,7 @@ def get_priority_breakdown(c):
     score = min(max(score, 0), 100)
     
     # Determine level
-    if score >= 85:
-        level = "Critical"
-    elif score >= 60:
+    if score >= 60:
         level = "High"
     elif score >= 40:
         level = "Medium"
@@ -924,61 +922,26 @@ elif menu == "🔥 Priority Matrix":
         for c in all_cases:
             case_breakdowns[c.get('id')] = get_priority_breakdown(c)
 
-        # Alerts detection list (needed for card counting)
-        alerts_list = []
-        
-        # 1. Oldest pending matter
-        oldest_case = None
-        max_age = 0
-        for c in all_cases:
-            bd = case_breakdowns[c.get('id')]
-            if bd["age_days"] > max_age:
-                max_age = bd["age_days"]
-                oldest_case = c
-        if oldest_case and max_age > 365 * 10:
-            alerts_list.append(f"⏳ **Oldest Pending Matter**: '{sanitize_metadata_field(oldest_case.get('case_number'), 'case_id')}' is {max_age // 365} years old.")
-            
-        # 2. Missing filing date
-        missing_date_cases = [c for c in all_cases if not c.get('filing_date') or c.get('filing_date') == "Not Available"]
-        if missing_date_cases:
-            alerts_list.append(f"⚠️ **Missing Metadata**: {len(missing_date_cases)} case(s) are missing filing date metadata.")
-            
-        # 3. Humanitarian-sensitive
-        humanitarian_cases = [c for c in all_cases if c.get('humanitarian_flag') or case_breakdowns[c.get('id')]["humanitarian_boost"] > 0]
-        if humanitarian_cases:
-            alerts_list.append(f"🚨 **Humanitarian Alert**: {len(humanitarian_cases)} sensitive matter(s) involving custody, personal liberty, or medical issues detected.")
-            
-        # 4. High priority backlog alert
-        backlog_cases = [c for c in all_cases if case_breakdowns[c.get('id')]["backlog_factor"] >= 80 and case_breakdowns[c.get('id')]["level"] in ["High", "Critical"]]
-        if backlog_cases:
-            alerts_list.append(f"🔴 **High Priority Backlog**: {len(backlog_cases)} extremely old matter(s) classified as High/Critical Priority.")
-
-        # A. Summary Cards
+        # A. Summary Cards (Priority Distribution only)
         total_cases = len(all_cases)
-        critical_cases = len([c for c in all_cases if case_breakdowns[c.get('id')]["level"] == 'Critical'])
         high_cases = len([c for c in all_cases if case_breakdowns[c.get('id')]["level"] == 'High'])
         medium_cases = len([c for c in all_cases if case_breakdowns[c.get('id')]["level"] == 'Medium'])
         low_cases = len([c for c in all_cases if case_breakdowns[c.get('id')]["level"] == 'Low'])
         avg_score = np.mean([case_breakdowns[c.get('id')]["score"] for c in all_cases]) if all_cases else 0.0
-        critical_alerts_count = len(alerts_list)
 
         st.markdown(f"""
-        <div style='display: grid; grid-template-columns: repeat(6, 1fr); gap: 15px; margin-bottom: 25px;'>
+        <div style='display: grid; grid-template-columns: repeat(5, 1fr); gap: 15px; margin-bottom: 25px;'>
             <div class='metric-card' style='border-left: 5px solid #3b82f6;'>
                 <p style='color:#64748b; font-size:12px; margin:0;'>TOTAL CASES</p>
                 <h3 style='color:#1e3a8a; font-size:24px; margin:5px 0 0 0;'>{total_cases}</h3>
             </div>
             <div class='metric-card' style='border-left: 5px solid #dc2626;'>
-                <p style='color:#64748b; font-size:12px; margin:0;'>CRITICAL ALERTS</p>
-                <h3 style='color:#dc2626; font-size:24px; margin:5px 0 0 0;'>{critical_alerts_count}</h3>
+                <p style='color:#64748b; font-size:12px; margin:0;'>HIGH PRIORITY</p>
+                <h3 style='color:#dc2626; font-size:24px; margin:5px 0 0 0;'>{high_cases}</h3>
             </div>
             <div class='metric-card' style='border-left: 5px solid #ea580c;'>
-                <p style='color:#64748b; font-size:12px; margin:0;'>HIGH PRIORITY</p>
-                <h3 style='color:#ea580c; font-size:24px; margin:5px 0 0 0;'>{high_cases}</h3>
-            </div>
-            <div class='metric-card' style='border-left: 5px solid #f59e0b;'>
                 <p style='color:#64748b; font-size:12px; margin:0;'>MEDIUM PRIORITY</p>
-                <h3 style='color:#d97706; font-size:24px; margin:5px 0 0 0;'>{medium_cases}</h3>
+                <h3 style='color:#ea580c; font-size:24px; margin:5px 0 0 0;'>{medium_cases}</h3>
             </div>
             <div class='metric-card' style='border-left: 5px solid #10b981;'>
                 <p style='color:#64748b; font-size:12px; margin:0;'>LOW PRIORITY</p>
@@ -1106,9 +1069,8 @@ elif menu == "🔥 Priority Matrix":
             fig.add_annotation(x=3.0, y=0.6, text="⚡ Operational Urgency", showarrow=False, font=dict(size=11, color="#c2410c", weight="bold"), bgcolor="rgba(255,247,237,0.9)", bordercolor="#fed7aa", borderwidth=1, borderpad=4)
             
             colors_map = {
-                'Critical': '#dc2626',
-                'High': '#ea580c',
-                'Medium': '#eab308',
+                'High': '#dc2626',
+                'Medium': '#ea580c',
                 'Low': '#22c55e'
             }
             
@@ -1249,14 +1211,31 @@ elif menu == "🔥 Priority Matrix":
             else:
                 st.info("Select a case in the Ranked Table to view its breakdown.")
 
-            # E. Alerts Panel
-            st.markdown("### 🚨 Active Alerts")
-            if not alerts_list:
-                st.success("🟢 No critical alerts.")
+            # E. Operational Alerts Section
+            st.markdown("### 🚨 Operational Alerts")
+            
+            # Dynamic calculations for operational issues across the active workload
+            missing_date = len([c for c in all_cases if not c.get('filing_date') or str(c.get('filing_date')).lower() in ['not available', 'none', 'null', '']])
+            ocr_incomplete = len([c for c in all_cases if c.get('extraction_method') == 'OCR' and (not c.get('title') or str(c.get('title')).lower() in ['not available', 'none', 'null', ''])])
+            missing_meta = len([c for c in all_cases if not c.get('petitioner') or str(c.get('petitioner')).lower() in ['not available', 'none', 'null', '']])
+            parsing_issues = len([c for c in all_cases if not c.get('summary') or str(c.get('summary')).lower() in ['not available', 'none', 'null', '']])
+            
+            op_alerts = []
+            if missing_date > 0:
+                op_alerts.append(f"⚠ <b>{missing_date} case(s)</b> missing filing date")
+            if ocr_incomplete > 0:
+                op_alerts.append(f"⚠ <b>{ocr_incomplete} case(s)</b> OCR extraction incomplete")
+            if missing_meta > 0:
+                op_alerts.append(f"⚠ <b>{missing_meta} case(s)</b> missing metadata (petitioner/respondent)")
+            if parsing_issues > 0:
+                op_alerts.append(f"⚠ <b>{parsing_issues} case(s)</b> AI parsing issues detected")
+                
+            if not op_alerts:
+                st.success("🟢 No critical operational alerts.")
             else:
-                for alert in alerts_list:
+                for alert in op_alerts:
                     st.markdown(f"""
-                    <div style='background-color:#fef2f2; border:1px solid #fee2e2; border-left:4px solid #ef4444; border-radius:6px; padding:10px; margin-bottom:8px; font-size:12px; color:#991b1b; line-height:1.3;'>
+                    <div style='background-color:#fffbeb; border:1px solid #fef3c7; border-left:4px solid #f59e0b; border-radius:6px; padding:10px; margin-bottom:8px; font-size:12px; color:#b45309; line-height:1.3;'>
                         {alert}
                     </div>
                     """, unsafe_allow_html=True)
@@ -1265,7 +1244,7 @@ elif menu == "🔥 Priority Matrix":
             st.markdown("### 🛠️ Recommended Actions")
             actions = []
             
-            high_critical = [c for c in all_cases if case_breakdowns[c.get('id')]["level"] in ['High', 'Critical']]
+            high_critical = [c for c in all_cases if case_breakdowns[c.get('id')]["level"] in ['High']]
             if high_critical:
                 top_priority_case = sorted(high_critical, key=lambda x: case_breakdowns[x.get('id')]["score"], reverse=True)[0]
                 actions.append(f"⚡ **Prioritize Top Urgent Matters**: Fast-track <i>{sanitize_metadata_field(top_priority_case.get('title'), 'title')}</i> ({sanitize_metadata_field(top_priority_case.get('case_number'), 'case_id')}) for immediate hearing.")
