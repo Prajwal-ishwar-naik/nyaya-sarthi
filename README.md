@@ -1,34 +1,31 @@
-# 🏛️ Judicial AI — Court Case Backlog Prioritization Engine
+# Judicial AI - Court Case Backlog Prioritization Engine
 
-**AI-Powered Court Case Backlog Prioritization, Semantic Clustering & Intelligent Scheduling Engine for the Indian Judiciary.**
-
-> *"A state-of-the-art judicial decision support system featuring a premium glassmorphism dashboard, multi-provider LLM fallback (Ollama + Groq + HuggingFace), and automated OCR extraction."*
+A decision support system for prioritizing court case backlogs, semantic clustering, and scheduling for the Indian judiciary. It features a Streamlit dashboard, multi-provider LLM integration (Ollama, Groq, Hugging Face) with fallback, and automated OCR extraction.
 
 ---
 
-## 🚀 Key Features
+## Key Features
 
-- **💎 Premium Dashboard**: A modern, high-performance HTML/JS Single Page Application (SPA) with glassmorphism UI and interactive Chart.js analytics.
-- **⚡ Groq Acceleration**: Ultra-fast legal document parsing using Groq (Llama 3.1) as the primary cloud LLM provider.
-- **🔄 Multi-Provider Fallback**: Intelligent fallback chain (Ollama ⮕ Groq ⮕ HuggingFace) ensures the system stays online even if a service fails.
-- **🔍 Robust OCR Extraction**: Automatic fallback to Tesseract OCR for scanned/image-based PDF documents.
-- **📑 Semantic Clustering**: Groups similar cases based on semantic legal questions to optimize judicial time and enable batch hearings.
-- **📅 Optimized Cause List**: Daily hearing schedule generated based on priority, humanitarian triage, and adjournment risk.
-
----
-
-## 🎨 Premium Dashboard Features
-
-The new standalone dashboard provides a high-end experience for judicial officers:
-- **Glassmorphism UI**: A sleek, translucent design system for focus and clarity.
-- **Interactive Analytics**: Real-time charts showing backlog trends and case types.
-- **Bulk Intake Zone**: Drag-and-drop multiple legal documents for parallel processing.
-- **Semantic Cluster Cards**: Visualize related cases grouped by legal similarity.
-- **Auto-Refreshing Cause List**: Optimized schedule that updates as new cases are processed.
+- **Prioritized Registry Dashboard**: An interactive Streamlit dashboard for visualizing and managing case queues.
+- **Groq Acceleration**: Fast legal document parsing utilizing Groq Llama 3.1 as the primary LLM provider.
+- **Multi-Provider Fallback**: Fallback chain (Ollama -> Groq -> HuggingFace) ensuring high availability.
+- **Robust OCR Extraction**: Automatic fallback to Tesseract OCR for scanned and image-based PDF documents.
+- **Semantic Clustering**: Groups similar cases based on semantic legal questions to optimize judicial scheduling and enable batch hearings.
+- **Optimized Cause List**: Daily hearing schedule generated based on priority, humanitarian factors, and adjournment risk.
 
 ---
 
-## 📊 Data Flow & AI Pipeline
+## Operational Prioritization Dashboard
+
+The dashboard provides a decision-support workspace for judicial officers:
+- **Aesthetic Metrics**: High-fidelity operational KPIs for at-a-glance status checks.
+- **Priority Heatmap**: Scatter plot mapping Urgency vs. Legal Impact/Complexity, with hash-based coordinate jittering for overlap resolution.
+- **Ranked Priority Table**: Selected case breakdown matching Case Registry metrics.
+- **Alerts and Actions**: Contextual alerts and recommended actions to triage humanitarian cases and optimize scheduling.
+
+---
+
+## Data Flow & AI Pipeline
 
 How a legal document transforms from a raw PDF into an optimized cause list:
 
@@ -51,16 +48,16 @@ graph TD
 
 ### **Step-by-Step Processing:**
 
-1.  **Ingestion & OCR**: When you upload a PDF, the `Intelligence Engine` first attempts to pull native text. If it's a scanned FIR or petition, it automatically triggers **Tesseract OCR** to "read" the images.
-2.  **LLM Legal Parsing**: The extracted text is sent to the LLM (Groq/Ollama). It identifies the Case Title, Petitioner/Respondent, Case Type, and generates a concise legal summary.
+1.  **Ingestion & OCR**: When a PDF is uploaded, the `Intelligence Engine` first attempts to pull native text. If it is a scanned file, it automatically triggers **Tesseract OCR** for processing.
+2.  **LLM Legal Parsing**: The extracted text is parsed by the LLM (Groq/Ollama) to identify Case Title, Petitioner/Respondent, Case Type, and generate a concise legal summary.
 3.  **Multi-Dimensional Scoring**: The `Analytics Engine` evaluates the extracted data to calculate an **Urgency Score (0-100)** and flags humanitarian concerns (e.g., undertrials, senior citizens).
-4.  **Semantic Vectorizing**: The `Engine Room` converts the case summary into a mathematical vector (embedding) and stores it in **ChromaDB**.
-5.  **DBSCAN Clustering**: The system analyzes the vectors to find cases with identical legal questions and groups them into **Semantic Clusters** for batch hearings.
-6.  **Intelligent Scheduling**: The `Scheduler` pulls the prioritized and clustered cases to generate a daily **Cause List**, ensuring high-priority cases are heard first.
+4.  **Semantic Vectorizing**: The `Engine Room` converts the case summary into a vector (embedding) and stores it in **ChromaDB**.
+5.  **DBSCAN Clustering**: The system analyzes the vectors to find cases with high semantic similarity and groups them into **Semantic Clusters** for batch hearings.
+6.  **Intelligent Scheduling**: The `Scheduler` pulls prioritized and clustered cases to generate a daily **Cause List**, ensuring high-priority cases are heard first.
 
 ---
 
-## 📂 Simplified Project Structure
+## Project Structure
 
 ```
 court_ai_judiciary/
@@ -69,13 +66,13 @@ court_ai_judiciary/
 │   ├── models/                 # SQLAlchemy Data Models
 │   ├── routes/                 # Clean API Endpoints
 │   └── main.py                 # FastAPI Entry Point
-├── core/                       # The Intelligence Engine
+├── core/                       # Core Analytics & Intelligence
 │   ├── intelligence.py         # LLM Parsing & OCR Extraction
 │   ├── analytics.py            # Urgency Scoring & Adjournment Prediction
 │   ├── engine.py               # Vector Store, Embeddings & Clustering
 │   └── scheduler.py            # Optimized Cause List Generation
-├── dashboard/                  # Frontend Assets
-│   └── static/                 # Premium HTML/CSS/JS SPA
+├── frontend/                   # Streamlit Frontend Dashboard
+│   └── app.py                  # Main Streamlit Application
 ├── data/                       # Local Data Persistence
 ├── run.py                      # Unified Platform Runner
 └── requirements.txt            # System Dependencies
@@ -83,7 +80,7 @@ court_ai_judiciary/
 
 ---
 
-## 🛠️ Tech Stack
+## Tech Stack
 
 | Layer | Technology |
 |---|---|
@@ -93,17 +90,17 @@ court_ai_judiciary/
 | **Vector DB** | **ChromaDB** |
 | **OCR / Docs** | **Tesseract** + **PDFPlumber** |
 | **Backend** | **FastAPI** |
-| **Dashboard** | **HTML5 / Vanilla CSS / Chart.js** |
+| **Dashboard** | **Streamlit** |
 | **Optimization** | **DBSCAN** Clustering + Heuristic Scheduling |
 
 ---
 
-## 🏁 Quick Start
+## Quick Start
 
 ### Prerequisites
 - Python 3.10+
 - Tesseract OCR: `brew install tesseract` (macOS)
-- (Optional) [Ollama](https://ollama.ai/) for local LLM execution
+- (Optional) Ollama for local LLM execution
 
 ### 1. Install Dependencies
 ```bash
@@ -123,12 +120,12 @@ CHROMA_API_KEY=ck-...
 python run.py
 ```
 
-- 📊 **Dashboard**: http://localhost:8000
-- 📡 **API Docs**: http://localhost:8000/docs
+- **Dashboard**: http://localhost:8501
+- **API Docs**: http://localhost:8000/docs
 
 ---
 
-## 🔑 Key API Endpoints
+## Key API Endpoints
 
 | Method | Endpoint | Description |
 |---|---|---|
