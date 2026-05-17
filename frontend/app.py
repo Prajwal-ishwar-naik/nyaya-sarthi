@@ -161,6 +161,74 @@ def calculate_final_priority(c):
     if score == 0: score = u
     return min(max(score, 0), 100)
 
+def calculate_complexity_impact(c):
+    """
+    Dynamically computes Legal Impact / Complexity based on case features:
+    - constitutional_flag (constitutional issues = high impact)
+    - case_type (criminal, civil, writ etc)
+    - statutes (extracted_statutes acts and sections count)
+    - citations (citations count)
+    Returns: (score, level) where level is "High", "Medium", or "Low"
+    """
+    score = 30.0 # baseline low-medium complexity
+    
+    # 1. Constitutional or PIL flag boost
+    if c.get('constitutional_flag') or 'pil' in str(c.get('case_type', '')).lower() or 'constitution' in str(c.get('case_type', '')).lower():
+        score += 40.0
+        
+    # 2. Case Type complexity weights
+    ct = str(c.get('case_type', '')).lower()
+    if 'criminal' in ct:
+        score += 20.0
+    elif 'writ' in ct:
+        score += 15.0
+    elif 'civil' in ct:
+        score += 10.0
+        
+    # 3. Statutes count boost
+    try:
+        statutes_str = c.get('extracted_statutes') or '[]'
+        if isinstance(statutes_str, str):
+            if statutes_str.startswith('['):
+                import json
+                statutes_list = json.loads(statutes_str)
+            else:
+                statutes_list = [s for s in statutes_str.split(',') if s.strip()]
+        elif isinstance(statutes_str, list):
+            statutes_list = statutes_str
+        else:
+            statutes_list = []
+        score += min(len(statutes_list) * 5, 20)
+    except:
+        pass
+        
+    # 4. Citations count boost
+    try:
+        citations_str = c.get('citations') or '[]'
+        if isinstance(citations_str, str):
+            if citations_str.startswith('['):
+                import json
+                citations_list = json.loads(citations_str)
+            else:
+                citations_list = [cit for cit in citations_str.split(',') if cit.strip()]
+        elif isinstance(citations_str, list):
+            citations_list = citations_str
+        else:
+            citations_list = []
+        score += min(len(citations_list) * 5, 20)
+    except:
+        pass
+        
+    score = min(max(score, 0), 100)
+    
+    if score >= 70:
+        return score, "High"
+    elif score >= 40:
+        return score, "Medium"
+    else:
+        return score, "Low"
+
+
 # Initialize session state for watchlist
 if 'watchlist' not in st.session_state:
     st.session_state.watchlist = []
@@ -647,7 +715,7 @@ elif menu == "📤 Upload & Processing":
 # 3. Priority Matrix
 # ────────────────────────────────────────────────────────
 elif menu == "🔥 Priority Matrix":
-    st.markdown("<h2 class='section-header'>🔥 Priority Matrix & Explainability</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 class='section-header'>🔥 Priority Matrix & Operational Decision Dashboard</h2>", unsafe_allow_html=True)
     
     # System Status Indicators
     st.sidebar.markdown("### System Status")
@@ -658,35 +726,337 @@ elif menu == "🔥 Priority Matrix":
     if not all_cases:
         st.info("No cases available for prioritization.")
     else:
-        table_data = []
-        for c in sorted(all_cases, key=lambda x: calculate_final_priority(x), reverse=True):
+        # A. Summary Cards
+        total_cases = len(all_cases)
+        critical_cases = len([c for c in all_cases if c.get('priority_level') == 'Critical'])
+        high_cases = len([c for c in all_cases if c.get('priority_level') == 'High'])
+        medium_cases = len([c for c in all_cases if c.get('priority_level') == 'Medium'])
+        low_cases = len([c for c in all_cases if c.get('priority_level') == 'Low'])
+        avg_score = np.mean([calculate_final_priority(c) for c in all_cases]) if all_cases else 0.0
+
+        st.markdown(f"""
+        <div style='display: grid; grid-template-columns: repeat(6, 1fr); gap: 15px; margin-bottom: 25px;'>
+            <div class='metric-card' style='border-left: 5px solid #3b82f6;'>
+                <p style='color:#64748b; font-size:12px; margin:0;'>TOTAL CASES</p>
+                <h3 style='color:#1e3a8a; font-size:24px; margin:5px 0 0 0;'>{total_cases}</h3>
+            </div>
+            <div class='metric-card' style='border-left: 5px solid #dc2626;'>
+                <p style='color:#64748b; font-size:12px; margin:0;'>CRITICAL ALERTS</p>
+                <h3 style='color:#dc2626; font-size:24px; margin:5px 0 0 0;'>{critical_cases}</h3>
+            </div>
+            <div class='metric-card' style='border-left: 5px solid #ea580c;'>
+                <p style='color:#64748b; font-size:12px; margin:0;'>HIGH PRIORITY</p>
+                <h3 style='color:#ea580c; font-size:24px; margin:5px 0 0 0;'>{high_cases}</h3>
+            </div>
+            <div class='metric-card' style='border-left: 5px solid #f59e0b;'>
+                <p style='color:#64748b; font-size:12px; margin:0;'>MEDIUM PRIORITY</p>
+                <h3 style='color:#d97706; font-size:24px; margin:5px 0 0 0;'>{medium_cases}</h3>
+            </div>
+            <div class='metric-card' style='border-left: 5px solid #10b981;'>
+                <p style='color:#64748b; font-size:12px; margin:0;'>LOW PRIORITY</p>
+                <h3 style='color:#059669; font-size:24px; margin:5px 0 0 0;'>{low_cases}</h3>
+            </div>
+            <div class='metric-card' style='border-left: 5px solid #6366f1;'>
+                <p style='color:#64748b; font-size:12px; margin:0;'>AVG PRIORITY SCORE</p>
+                <h3 style='color:#4f46e5; font-size:24px; margin:5px 0 0 0;'>{avg_score:.1f}%</h3>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Split page: Left Column (70%) for Matrix and Ranked Table, Right Column (30%) for Breakdown & Actions
+        col_left, col_right = st.columns([7, 3])
+
+        # Prepare Matrix Data with Jittering for visual display
+        matrix_data = []
+        import hashlib
+        for c in all_cases:
             p_score = calculate_final_priority(c)
+            comp_score, comp_level = calculate_complexity_impact(c)
+            u_score = float(c.get('urgency_score', 0) or 0)
             
-            # Skip cases with 0% across the board to keep matrix clean
-            if p_score == 0:
-                continue
+            # Determine Urgency Level
+            if u_score >= 70:
+                u_level = "High"
+                x_coord = 3.0
+            elif u_score >= 40:
+                u_level = "Medium"
+                x_coord = 2.0
+            else:
+                u_level = "Low"
+                x_coord = 1.0
                 
-            table_data.append({
-                "Case": c.get('title'),
-                "Urgency": (c.get('urgency_score', 0) or 0) / 100.0,
-                "Backlog": (c.get('backlog_score', 0) or 0) / 100.0,
+            # Determine Complexity Coordinate
+            if comp_level == "High":
+                y_coord = 3.0
+            elif comp_level == "Medium":
+                y_coord = 2.0
+            else:
+                y_coord = 1.0
+                
+            # Stable Jitter coordinate generation based on case ID hash
+            h_val = int(hashlib.md5(str(c.get('id', '')).encode()).hexdigest(), 16)
+            jitter_x = ((h_val % 100) / 100.0 - 0.5) * 0.35
+            jitter_y = (((h_val // 100) % 100) / 100.0 - 0.5) * 0.35
+            
+            matrix_data.append({
+                "Case ID": sanitize_metadata_field(c.get('case_number'), 'case_id'),
+                "Case Title": sanitize_metadata_field(c.get('title'), 'title'),
                 "Priority Score": p_score,
-                "Priority": c.get('priority_level'),
-                "AI Reason": c.get('reasoning', '')
+                "Priority Level": c.get('priority_level', 'Low'),
+                "Urgency Score": u_score,
+                "Urgency Level": u_level,
+                "Complexity Score": comp_score,
+                "Complexity Level": comp_level,
+                "X": x_coord + jitter_x,
+                "Y": y_coord + jitter_y,
             })
             
-        df = pd.DataFrame(table_data)
-        st.data_editor(
-            df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Urgency": st.column_config.ProgressColumn("Urgency", min_value=0.0, max_value=1.0, format="%d%%"),
-                "Backlog": st.column_config.ProgressColumn("Backlog", min_value=0.0, max_value=1.0, format="%d%%"),
-                "Priority Score": st.column_config.NumberColumn("Priority Score", format="%d%%"),
-                "Priority": st.column_config.TextColumn("Final Priority")
+        df_matrix = pd.DataFrame(matrix_data)
+
+        # Ranked Priority Table Data Preparation
+        table_rows = []
+        for idx, c in enumerate(sorted(all_cases, key=lambda x: calculate_final_priority(x), reverse=True)):
+            p_score = calculate_final_priority(c)
+            table_rows.append({
+                "Rank": idx + 1,
+                "InternalID": c.get('id'),
+                "Case ID": sanitize_metadata_field(c.get('case_number'), 'case_id'),
+                "Case Title": sanitize_metadata_field(c.get('title'), 'title'),
+                "Priority Score": p_score,
+                "Priority Level": c.get('priority_level', 'Low'),
+                "Urgency Reason": c.get('reasoning') or 'Standard prioritization applied.',
+                "Select": False
+            })
+        df_ranked = pd.DataFrame(table_rows)
+
+        # Active case selection handling
+        if 'active_matrix_case_id' not in st.session_state:
+            st.session_state.active_matrix_case_id = None
+
+        with col_left:
+            # B. Priority Heatmap / Matrix
+            st.markdown("### 🗺️ Priority Analytics Matrix")
+            st.caption("Visual representation of Urgency (X-axis) vs. Legal Impact/Complexity (Y-axis).")
+            
+            fig = go.Figure()
+            
+            # Quadrant boundary lines
+            fig.add_shape(type="line", x0=1.5, y0=0.5, x1=1.5, y1=3.5, line=dict(color="#cbd5e1", width=1.5, dash="dash"))
+            fig.add_shape(type="line", x0=2.5, y0=0.5, x1=2.5, y1=3.5, line=dict(color="#cbd5e1", width=1.5, dash="dash"))
+            fig.add_shape(type="line", x0=0.5, y0=1.5, x1=3.5, y1=1.5, line=dict(color="#cbd5e1", width=1.5, dash="dash"))
+            fig.add_shape(type="line", x0=0.5, y0=2.5, x1=3.5, y1=2.5, line=dict(color="#cbd5e1", width=1.5, dash="dash"))
+            
+            colors_map = {
+                'Critical': '#dc2626',
+                'High': '#ea580c',
+                'Medium': '#eab308',
+                'Low': '#22c55e'
             }
-        )
+            
+            # Add scatter markers grouped by priority
+            for prio, color in colors_map.items():
+                sub_df = df_matrix[df_matrix["Priority Level"] == prio]
+                if not sub_df.empty:
+                    fig.add_trace(go.Scatter(
+                        x=sub_df["X"],
+                        y=sub_df["Y"],
+                        mode="markers+text" if len(sub_df) < 15 else "markers",
+                        name=prio,
+                        text=sub_df["Case ID"],
+                        textposition="top center",
+                        marker=dict(
+                            size=sub_df["Priority Score"] * 0.25 + 15,
+                            color=color,
+                            opacity=0.85,
+                            line=dict(width=1.5, color="#ffffff")
+                        ),
+                        hovertemplate=(
+                            "<b>%{customdata[0]}</b><br>"
+                            "ID: %{text}<br>"
+                            "Priority Score: %{customdata[1]:.0f}% (%{customdata[2]})<br>"
+                            "Urgency Score: %{customdata[3]:.0f}% (%{customdata[4]})<br>"
+                            "Complexity Score: %{customdata[5]:.0f}% (%{customdata[6]})"
+                            "<extra></extra>"
+                        ),
+                        customdata=sub_df[["Case Title", "Priority Score", "Priority Level", "Urgency Score", "Urgency Level", "Complexity Score", "Complexity Level"]].values
+                    ))
+            
+            fig.update_layout(
+                xaxis=dict(
+                    title="Urgency Level",
+                    tickmode="array",
+                    tickvals=[1, 2, 3],
+                    ticktext=["Low (<40%)", "Medium (40-70%)", "High (≥70%)"],
+                    range=[0.5, 3.5],
+                    gridcolor="#f1f5f9",
+                    zeroline=False
+                ),
+                yaxis=dict(
+                    title="Legal Impact & Complexity",
+                    tickmode="array",
+                    tickvals=[1, 2, 3],
+                    ticktext=["Low (<40%)", "Medium (40-70%)", "High (≥70%)"],
+                    range=[0.5, 3.5],
+                    gridcolor="#f1f5f9",
+                    zeroline=False
+                ),
+                plot_bgcolor="rgba(248, 250, 252, 0.6)",
+                paper_bgcolor="rgba(0,0,0,0)",
+                margin=dict(l=40, r=40, t=10, b=40),
+                height=380,
+                showlegend=True,
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=1.02,
+                    xanchor="right",
+                    x=1
+                )
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # C. Ranked Priority Table
+            st.markdown("### 🏆 Ranked Priority Table")
+            st.caption("Cases sorted dynamically by computed priority. Use **Select** to inspect scoring components.")
+            
+            edited_df = st.data_editor(
+                df_ranked,
+                column_config={
+                    "InternalID": None,
+                    "Rank": st.column_config.NumberColumn("Rank", width="small"),
+                    "Priority Score": st.column_config.NumberColumn("Score", format="%d%%", width="small"),
+                    "Select": st.column_config.CheckboxColumn("Select", help="Check to inspect score breakdown", default=False),
+                },
+                disabled=["Rank", "Case ID", "Case Title", "Priority Score", "Priority Level", "Urgency Reason"],
+                hide_index=True,
+                use_container_width=True,
+                key="priority_matrix_editor"
+            )
+            
+            # Capture selection
+            selected_ids = edited_df[edited_df["Select"] == True]["InternalID"].tolist()
+            if selected_ids:
+                st.session_state.active_matrix_case_id = selected_ids[0]
+
+        # Determine active case for right-hand analytical panels
+        active_case_id = st.session_state.active_matrix_case_id
+        if not active_case_id and not df_ranked.empty:
+            active_case_id = df_ranked.iloc[0]["InternalID"]
+            
+        active_case = next((c for c in all_cases if c.get('id') == active_case_id), None)
+
+        with col_right:
+            # D. Score Breakdown Panel
+            if active_case:
+                st.markdown("### 📊 Score Breakdown")
+                st.markdown(f"**Case ID:** {sanitize_metadata_field(active_case.get('case_number'), 'case_id')}")
+                st.markdown(f"<p style='font-size:14px; color:#475569; font-weight:600; margin-top:-5px;'>{sanitize_metadata_field(active_case.get('title'), 'title')}</p>", unsafe_allow_html=True)
+                
+                p_score = calculate_final_priority(active_case)
+                u = float(active_case.get('urgency_score', 0) or 0)
+                b = float(active_case.get('backlog_score', 0) or 0)
+                h = 20.0 if active_case.get('humanitarian_flag') else 0.0
+                
+                p_color = colors_map.get(active_case.get('priority_level', 'Low'), '#22c55e')
+                
+                st.markdown(f"""
+                <div style='background: #ffffff; border: 1px solid #e2e8f0; border-left: 6px solid {p_color}; padding: 15px; border-radius: 10px; margin-bottom: 20px; text-align: center; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.02);'>
+                    <p style='margin:0; font-size:11px; color:#64748b; text-transform:uppercase; letter-spacing:0.5px;'>Weighted Priority Score</p>
+                    <h2 style='margin:5px 0 0 0; color:#1e3a8a; font-size:38px; font-weight:700;'>{p_score:.0f}/100</h2>
+                    <span style='background-color:{p_color}18; color:{p_color}; border: 1px solid {p_color}40; padding:3px 12px; border-radius:20px; font-size:11px; font-weight:700; display:inline-block; margin-top:5px; text-transform:uppercase;'>
+                        {active_case.get('priority_level', 'Low')} Priority
+                    </span>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Heuristic badges and delay flags
+                reasons = []
+                age_days = active_case.get('case_age_days', 0)
+                if age_days > 365 * 3:
+                    years = age_days // 365
+                    reasons.append(f"⏳ **Old Pending Case**: Case is over {years} years old ({age_days} days), generating a substantial backlog backlog score.")
+                
+                ct = str(active_case.get('case_type', '')).lower()
+                if 'criminal' in ct:
+                    reasons.append("⚖️ **Criminal Severity**: High seriousness case category demanding urgent judicial attention.")
+                    
+                if active_case.get('humanitarian_flag'):
+                    reasons.append("🚨 **Humanitarian Concern**: Highlights senior citizens, physical vulnerability, or liberty issue.")
+                    
+                inactivity = active_case.get('inactivity_days', 0)
+                if inactivity > 180:
+                    reasons.append(f"⚠️ **Delay Risk**: Over {inactivity} days since last court action increases risk of denial of justice.")
+                    
+                if not reasons:
+                    reasons.append("📝 **Standard Prioritization**: Routine prioritization based on standard age and statutory weightings.")
+                
+                st.markdown("**Scoring Breakdown Weights**")
+                st.caption("Formula: 60% Urgency + 30% Backlog + 10% Humanitarian")
+                
+                st.markdown(f"**Urgency Factor** ({u:.0f}/100)")
+                st.progress(u / 100.0)
+                
+                st.markdown(f"**Backlog Factor** ({b:.0f}/100)")
+                st.progress(b / 100.0)
+                
+                st.markdown(f"**Humanitarian Boost** ({h:.0f}/20)")
+                st.progress(h / 20.0)
+                
+                st.markdown("<p style='font-weight:600; margin-bottom:5px; font-size:13px; color:#1e293b;'>Why Score Was Assigned</p>", unsafe_allow_html=True)
+                for reason in reasons:
+                    st.markdown(f"<div style='font-size:12px; color:#475569; margin-bottom:8px; line-height:1.4;'>{reason}</div>", unsafe_allow_html=True)
+            else:
+                st.info("Select a case in the Ranked Table to view its breakdown.")
+
+            # E. Alerts Panel
+            st.markdown("### 🚨 Active Alerts")
+            alerts = []
+            
+            critical_alerts = [c for c in all_cases if c.get('priority_level') == 'Critical']
+            if critical_alerts:
+                alerts.append(f"🔴 **Immediate Review Needed**: {len(critical_alerts)} Critical matter(s) require prompt hearing schedule.")
+                
+            humanitarian_alerts = [c for c in all_cases if c.get('humanitarian_flag') and float(c.get('urgency_score', 0) or 0) >= 75]
+            if humanitarian_alerts:
+                alerts.append(f"🚑 **Humanitarian Emergency**: {len(humanitarian_alerts)} high-urgency humanitarian case(s) pending.")
+                
+            long_pending = [c for c in all_cases if c.get('case_age_days', 0) >= 365 * 5 and c.get('priority_level') in ['High', 'Critical']]
+            if long_pending:
+                alerts.append(f"⏳ **Long Pending High-Risk**: {len(long_pending)} case(s) older than 5 years remain unresolved.")
+                
+            if not alerts:
+                st.success("🟢 No active alerts. Registry workload is standard.")
+            else:
+                for alert in alerts:
+                    st.markdown(f"""
+                    <div style='background-color:#fef2f2; border:1px solid #fee2e2; border-left:4px solid #ef4444; border-radius:6px; padding:10px; margin-bottom:8px; font-size:12px; color:#991b1b; line-height:1.3;'>
+                        {alert}
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            # F. Recommended Actions
+            st.markdown("### 🛠️ Recommended Actions")
+            actions = []
+            
+            high_critical = [c for c in all_cases if c.get('priority_level') in ['High', 'Critical']]
+            if high_critical:
+                top_priority_case = sorted(high_critical, key=lambda x: calculate_final_priority(x), reverse=True)[0]
+                actions.append(f"⚡ **Prioritize Top Urgent Matters**: Fast-track <i>{sanitize_metadata_field(top_priority_case.get('title'), 'title')}</i> ({sanitize_metadata_field(top_priority_case.get('case_number'), 'case_id')}) for immediate hearing.")
+                
+            humanitarian_all = [c for c in all_cases if c.get('humanitarian_flag')]
+            if humanitarian_all:
+                actions.append(f"🏥 **Review Humanitarian Cases First**: Triage the {len(humanitarian_all)} pending humanitarian case(s) to address personal liberties.")
+                
+            low_priority_all = [c for c in all_cases if c.get('priority_level') == 'Low']
+            if low_priority_all:
+                actions.append(f"📅 **Schedule Low-Priority Later**: Defer the {len(low_priority_all)} low-priority matter(s) to clear current backlog congestion.")
+                
+            if not actions:
+                actions.append("✅ **Regular Ingestion**: Backlog pressure is healthy; continue normal court operations.")
+                
+            for action in actions:
+                st.markdown(f"<div style='font-size:12px; color:#334155; margin-bottom:8px; line-height:1.4;'>{action}</div>", unsafe_allow_html=True)
+
 
 
 # ────────────────────────────────────────────────────────
