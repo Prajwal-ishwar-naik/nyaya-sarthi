@@ -23,6 +23,18 @@ async def upload_document(
     if "error" in extracted_data:
         raise HTTPException(status_code=400, detail=extracted_data["error"])
         
+    # Case Classification & Priority Scoring
+    case_type = extracted_data.get("case_type_inferred", "General")
+    extracted_data["case_type"] = case_type
+    
+    priority_data = analytics_engine.calculate_priority_score(extracted_data, extracted_data.get("full_text", ""))
+    
+    raw_case_num = extracted_data.get("case_number_extracted")
+    if not raw_case_num or str(raw_case_num).lower() in ["unknown", "not detected", "none", ""]:
+        raw_case_num = "No ID"
+        
+    case_number = f"{raw_case_num} | {file.filename}"
+    
     # Check for existing case to prevent IntegrityError
     existing_case = db.query(Case).filter(Case.case_number == case_number).first()
     
@@ -30,17 +42,19 @@ async def upload_document(
         # Update existing record
         existing_case.title = extracted_data.get("case_title")
         existing_case.court_name = extracted_data.get("court_name")
-        existing_case.case_type = extracted_data.get("case_type")
+        existing_case.bench = extracted_data.get("bench", "Not Available")
+        existing_case.case_type = case_type
         existing_case.petitioner = extracted_data.get("petitioner")
         existing_case.respondent = extracted_data.get("respondent")
-        existing_case.summary = extracted_data.get("legal_summary")
-        existing_case.legal_issue = extracted_data.get("legal_issue")
+        existing_case.summary = extracted_data.get("summary") or extracted_data.get("legal_summary")
+        existing_case.legal_issue = extracted_data.get("core_legal_issue") or extracted_data.get("legal_issue")
         existing_case.relief_sought = extracted_data.get("relief_sought")
-        existing_case.urgency_score = priority_data["score"]
+        existing_case.urgency_score = priority_data["urgency"]
+        existing_case.backlog_score = priority_data["backlog"]
         existing_case.priority_level = priority_data["level"]
-        existing_case.reasoning = analytics_engine.generate_explanation(extracted_data, priority_data)
-        existing_case.is_active = True # Restore if hidden
-        existing_case.raw_content = str(extracted_data)
+        existing_case.reasoning = priority_data["explanation"]
+        existing_case.is_active = True
+        existing_case.extraction_method = extracted_data.get("extraction_method")
         existing_case.status = "Processed"
         case_to_save = existing_case
     else:
@@ -48,27 +62,62 @@ async def upload_document(
             case_number=case_number,
             title=extracted_data.get("case_title"),
             court_name=extracted_data.get("court_name"),
-            case_type=extracted_data.get("case_type"),
+            bench=extracted_data.get("bench", "Not Available"),
+            case_type=case_type,
             petitioner=extracted_data.get("petitioner"),
             respondent=extracted_data.get("respondent"),
-            summary=extracted_data.get("legal_summary"),
-            legal_issue=extracted_data.get("legal_issue"),
+            summary=extracted_data.get("summary") or extracted_data.get("legal_summary"),
+            legal_issue=extracted_data.get("core_legal_issue") or extracted_data.get("legal_issue"),
             relief_sought=extracted_data.get("relief_sought"),
-            clustering_compatibility=extracted_data.get("clustering_compatibility"),
-            scheduling_compatibility=extracted_data.get("scheduling_compatibility"),
-            urgency_score=priority_data["score"],
+            urgency_score=priority_data["urgency"],
+            backlog_score=priority_data["backlog"],
             confidence_score=extracted_data.get("confidence_score", 0),
             priority_level=priority_data["level"],
-            reasoning=analytics_engine.generate_explanation(extracted_data, priority_data),
+            reasoning=priority_data["explanation"],
             humanitarian_flag=analytics_engine.evaluate_humanitarian(extracted_data),
-            extracted_statutes=str(extracted_data.get("statutes_sections", [])),
-            raw_content=str(extracted_data),
+            extracted_statutes=json.dumps(extracted_data.get("acts", []) + extracted_data.get("sections", [])),
+            citations=json.dumps(extracted_data.get("citations", [])),
+            case_age_days=extracted_data.get("case_age_days", 0),
+            extraction_method=extracted_data.get("extraction_method"),
+            raw_content=json.dumps(extracted_data),
             status="Processed",
             is_active=True
         )
         db.add(new_case)
         case_to_save = new_case
-        
+
+    # Handle Dates & Case Age
+    from dateutil.relativedelta import relativedelta
+    
+    f_date = extracted_data.get("filing_date")
+    j_date = extracted_data.get("judgment_date")
+    h_date = extracted_data.get("hearing_date")
+    
+    parsed_dates = {}
+    for k, v in [("filing_date", f_date), ("judgment_date", j_date), ("hearing_date", h_date)]:
+        if v and str(v).lower() not in ["not available", "none", "unknown", ""]:
+            try:
+                dt = datetime.strptime(str(v), "%Y-%m-%d")
+                parsed_dates[k] = dt
+                setattr(case_to_save, k, dt)
+            except:
+                setattr(case_to_save, k, None)
+        else:
+            setattr(case_to_save, k, None)
+
+    # Compute Precise Case Age
+    base_date = parsed_dates.get("filing_date")
+    if base_date:
+        diff = relativedelta(datetime.utcnow(), base_date)
+        age_str = f"{diff.years} years, {diff.months} months, {diff.days} days"
+        case_to_save.case_age_days = (datetime.utcnow() - base_date).days
+        extracted_data["formatted_age"] = age_str
+    else:
+        case_to_save.case_age_days = 0
+        extracted_data["formatted_age"] = "Not Available"
+
+    case_to_save.raw_content = json.dumps(extracted_data)
+
     db.commit()
     db.refresh(case_to_save)
     
@@ -80,7 +129,7 @@ async def upload_document(
     
     return {
         "message": "Success", 
-        "case_id": new_case.id, 
+        "case_id": case_to_save.id, 
         "case_number": case_number,
         "extraction_method": extracted_data.get("extraction_method", "Unknown"),
         "extracted_length": extracted_data.get("extracted_length", 0),
@@ -226,7 +275,8 @@ async def upload_bulk_documents(
             processed_cases.append(case_to_save)
             results.append({
                 "file": file.filename, 
-                "case_number": case_number, 
+                "case_number": case_number,
+                "case_id": case_to_save.id,
                 "status": "success",
                 "case_type": case_type,
                 "urgency_score": priority_data["urgency"]

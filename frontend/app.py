@@ -4,7 +4,7 @@ import time
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import numpy as np
 
@@ -417,12 +417,113 @@ def calculate_complexity_impact(c):
         return score, "Medium"
     else:
         return score, "Low"
+def calculate_humanitarian_triage(c):
+    """
+    Dynamically assesses humanitarian risk factors across the case text and metadata:
+    - Medical emergencies (surgery, cancer, hospital treatment)
+    - Child/women protection (custody, maintenance, domestic violence)
+    - Senior citizen vulnerabilities (pension, retirement, elderly support)
+    - shelter/personal liberty crises (bail, arrest, eviction stay)
+    - Backlog delay severity
+    """
+    title = str(c.get('title', '')).lower()
+    summary = str(c.get('summary', '')).lower()
+    full_text = str(c.get('extracted_text', '')).lower()
+    combined = f"{title} {summary} {full_text}"
+    
+    # 1. Signals Extraction
+    signals = []
+    med_score = 0
+    if any(k in combined for k in ['medical', 'health', 'hospital', 'cancer', 'treatment', 'ailment', 'physically disabled', 'surgery', 'disease']):
+        signals.append("🏥 Medical Emergency Signal")
+        med_score = 25
+        
+    child_women_score = 0
+    if any(k in combined for k in ['custody', 'child', 'women', 'domestic violence', 'dowry', 'maintenance', 'divorce', 'minor', 'juvenile', 'harassment']):
+        signals.append("👧 Child/Women Protection Signal")
+        child_women_score = 25
+        
+    senior_score = 0
+    if any(k in combined for k in ['senior citizen', 'aged', 'pension', 'elderly', 'gratuity', 'old age', 'retirement']):
+        signals.append("👵 Senior Citizen Risk Signal")
+        senior_score = 20
+        
+    shelter_liberty_score = 0
+    if any(k in combined for k in ['bail', 'custody', 'arrest', 'habeas corpus', 'eviction', 'shelter', 'demolition', 'possession', 'tenant', 'landlord']):
+        signals.append("🏠 Shelter/Personal Liberty Crisis")
+        shelter_liberty_score = 20
+        
+    # Case Age Delay Component
+    age_score = 0
+    fd = c.get('filing_date')
+    age_days = 0
+    if fd:
+        try:
+            from datetime import datetime
+            if isinstance(fd, str):
+                dt = datetime.fromisoformat(fd.replace("Z", ""))
+            elif isinstance(fd, datetime):
+                dt = fd
+            age_days = (datetime.now() - dt).days
+        except:
+            pass
+            
+    if age_days > 3650: # 10+ years
+        age_score = 10
+    elif age_days > 1825: # 5+ years
+        age_score = 5
+        
+    total_score = med_score + child_women_score + senior_score + shelter_liberty_score + age_score
+    total_score = min(total_score, 100)
+    
+    # Determine risk level
+    if total_score >= 60:
+        level = "Extreme"
+    elif total_score >= 45:
+        level = "High"
+    elif total_score >= 20:
+        level = "Moderate"
+    else:
+        level = "Low"
+        
+    # Determine relief needed
+    reliefs = []
+    if med_score > 0:
+        reliefs.append("Healthcare Access / Medical Triage")
+    if child_women_score > 0:
+        reliefs.append("Custody Triage / Interim Protection Order")
+    if senior_score > 0:
+        reliefs.append("Expedited Pension Release")
+    if shelter_liberty_score > 0:
+        reliefs.append("Bail / Eviction Stay Review")
+        
+    relief_needed = ", ".join(reliefs) if reliefs else "General Fast-Track Hearing"
+    
+    return {
+        "score": total_score,
+        "level": level,
+        "signals": signals,
+        "med_score": med_score,
+        "child_women_score": child_women_score,
+        "senior_score": senior_score,
+        "shelter_liberty_score": shelter_liberty_score,
+        "age_score": age_score,
+        "age_days": age_days,
+        "relief_needed": relief_needed,
+        "is_humanitarian": (total_score >= 20 or c.get('humanitarian_flag'))
+    }
 
 
 
 # Initialize session state for watchlist
 if 'watchlist' not in st.session_state:
     st.session_state.watchlist = []
+
+# Initialize session state for upload batches
+if 'current_upload_batch_case_numbers' not in st.session_state:
+    st.session_state.current_upload_batch_case_numbers = []
+if 'current_upload_batch_db_ids' not in st.session_state:
+    st.session_state.current_upload_batch_db_ids = []
 
 # Metadata Sanitization Engine
 def sanitize_metadata_field(value, field_type="general"):
@@ -440,6 +541,19 @@ def sanitize_metadata_field(value, field_type="general"):
     v = v.split('|')[0].strip()
     v = v.replace("Not Available", "").replace("not available", "").strip()
     
+    # Automatically unpack stringified list representations (e.g. "['Judge 1', 'Judge 2']")
+    if v.startswith('[') and v.endswith(']'):
+        try:
+            import ast
+            parsed_list = ast.literal_eval(v)
+            if isinstance(parsed_list, list):
+                v = ", ".join(str(item).strip() for item in parsed_list)
+        except:
+            pass
+
+    # Replace newlines with spaces to avoid breaking markdown formatting
+    v = v.replace('\r\n', ' ').replace('\n', ' ').strip()
+    
     # Remove dates (e.g. "on 5 December 1975" or "on 05/12/1975")
     import re
     date_patterns = [
@@ -454,7 +568,7 @@ def sanitize_metadata_field(value, field_type="general"):
     v = re.sub(r'Equivalent citations.*$', '', v, flags=re.IGNORECASE)
     v = re.sub(r'https?://\S+', '', v)
     v = re.sub(r'www\.\S+', '', v)
-    v = re.sub(r'\.{2,}', '', v) # Remove repeated dots
+    v = re.sub(r'\.{2,}', '', v) # Remove repeated dots (keep single initials like A.K. Sen)
     
     v = v.strip()
     if not v or v.lower() in ["none", "null", "not available"]:
@@ -479,8 +593,9 @@ def sanitize_metadata_field(value, field_type="general"):
         if any(c in v for c in [":", "{", "}", "[", "]"]) or len(v.split()) > 10:
             return "Not Available"
 
-    # Paragraph Detection
-    if v.count('\n') > 0 or v.count('.') > 2:
+    # Paragraph Detection (ignore dots if they are initials or abbreviations like J., CJ., C.A.)
+    # We count sentences by looking for dots followed by a space and capital letter, not just dots alone.
+    if len(re.findall(r'\.\s+[A-Z]', v)) > 2:
         return "Not Available"
         
     # Keyword triggers
@@ -504,10 +619,30 @@ def show_case_details(case_data):
         else: raw = raw_str
     except: pass
 
+    smeta = raw.get('structured_meta', {})
+
+    def _pick(*keys_from_dicts):
+        """Try structured_meta first, then raw, then case_data directly."""
+        for val in keys_from_dicts:
+            if val and str(val).strip().lower() not in ('', 'not available', 'none', 'null', 'nan'):
+                return str(val).strip()
+        return "Not Available"
+
+    # Single source of truth metadata picks
+    ov_title      = _pick(smeta.get('case_title'), raw.get('case_title'), case_data.get('title'))
+    ov_case_num   = _pick(smeta.get('case_number_extracted'), raw.get('case_number_extracted'), case_data.get('case_number'))
+    ov_court      = _pick(smeta.get('court_name'), raw.get('court_name'), case_data.get('court_name'))
+    ov_petitioner = _pick(smeta.get('petitioner'), raw.get('petitioner'), case_data.get('petitioner'))
+    ov_respondent = _pick(smeta.get('respondent'), raw.get('respondent'), case_data.get('respondent'))
+    ov_bench      = _pick(smeta.get('bench'), raw.get('bench'), case_data.get('bench'))
+    ov_author     = _pick(smeta.get('author_judge'), raw.get('author_judge'), case_data.get('author_judge'))
+    ov_outcome    = _pick(raw.get('legal_outcome'), case_data.get('legal_outcome'))
+    ov_issue      = _pick(raw.get('core_legal_issue'), case_data.get('legal_issue'), case_data.get('core_legal_issue'))
+
     # --- SECTION 0: CASE HEADER ---
     st.markdown(f"<div style='background: #f0f2f6; padding: 1.5rem; border-radius: 10px; margin-bottom: 1rem;'>"
-                f"<h2 style='margin:0; color: #1e3a8a;'>{sanitize_metadata_field(case_data.get('title'), 'title')}</h2>"
-                f"<p style='margin:0; color: #64748b;'>Case ID: {sanitize_metadata_field(case_data.get('case_number'), 'case_id')} | {sanitize_metadata_field(case_data.get('court_name'), 'court')}</p></div>", 
+                f"<h2 style='margin:0; color: #1e3a8a;'>{sanitize_metadata_field(ov_title, 'title')}</h2>"
+                f"<p style='margin:0; color: #64748b;'>Case ID: {sanitize_metadata_field(ov_case_num, 'case_id')} | {sanitize_metadata_field(ov_court, 'court')}</p></div>", 
                 unsafe_allow_html=True)
     
     # Priority Metrics Header
@@ -532,8 +667,8 @@ def show_case_details(case_data):
     # --- 1. Intelligence Summary ---
     st.markdown("### 📝 Intelligence Summary")
     summary = case_data.get('summary', '')
-    # Handle both old 'legal_summary' and new 'summary' fields
     if not summary: summary = case_data.get('legal_summary', '')
+    if not summary: summary = raw.get('summary', '')
     
     if not summary or "pending full summarization" in str(summary).lower() or len(str(summary)) < 30:
         st.write("Not Available")
@@ -543,24 +678,19 @@ def show_case_details(case_data):
     # --- 2. Core Legal Issue ---
     st.markdown("### ⚖️ Core Legal Issue")
     with st.container(border=True):
-        issue = case_data.get('legal_issue')
-        if not issue: issue = case_data.get('core_legal_issue')
-        st.write(issue or "Not Available")
+        st.write(ov_issue)
 
     # --- 3. Relief Requested ---
     st.markdown("### 📜 Relief Requested")
     with st.container(border=True):
-        st.write(case_data.get('relief_sought') or "Not Available")
+        st.write(case_data.get('relief_sought') or raw.get('relief_sought') or "Not Available")
 
     # --- 4. Final Decision / Outcome ---
     st.markdown("### ✅ Final Decision / Outcome")
-    outcome = case_data.get('legal_outcome')
-    if not outcome: outcome = raw.get('legal_outcome', '')
-    
-    if not outcome or "not available" in str(outcome).lower() or "pending review" in str(outcome).lower():
+    if not ov_outcome or "not available" in str(ov_outcome).lower() or "pending review" in str(ov_outcome).lower():
         st.warning("🕒 Outcome Pending Review")
     else:
-        st.success(f"Outcome: {outcome}")
+        st.success(f"Outcome: {ov_outcome}")
 
     st.markdown("---")
     col1, col2 = st.columns(2)
@@ -569,24 +699,25 @@ def show_case_details(case_data):
     with col1:
         st.markdown("### 👥 Parties & Bench")
         with st.container(border=True):
-            st.markdown(f"**Petitioner/Appellant:** {sanitize_metadata_field(case_data.get('petitioner'), 'party')}")
-            st.markdown(f"**Respondent:** {sanitize_metadata_field(case_data.get('respondent'), 'party')}")
-            st.markdown(f"**Bench/Judges:** {sanitize_metadata_field(case_data.get('bench'), 'bench')}")
-            st.markdown(f"**Court:** {sanitize_metadata_field(case_data.get('court_name'), 'court')}")
+            st.markdown(f"**Petitioner/Appellant:** {sanitize_metadata_field(ov_petitioner, 'party')}")
+            st.markdown(f"**Respondent:** {sanitize_metadata_field(ov_respondent, 'party')}")
+            st.markdown(f"**Bench:** {sanitize_metadata_field(ov_bench, 'bench')}")
+            st.markdown(f"**Author:** {sanitize_metadata_field(ov_author, 'general')}")
+            st.markdown(f"**Court:** {sanitize_metadata_field(ov_court, 'court')}")
 
     # --- 6. Timeline Analysis ---
     with col2:
         st.markdown("### 📅 Timeline Analysis")
         with st.container(border=True):
             # Dynamic date resolution
-            f_val = case_data.get('filing_date') or raw.get('filing_date')
-            j_val = case_data.get('judgment_date') or raw.get('judgment_date')
-            h_val = case_data.get('hearing_date') or raw.get('hearing_date')
+            f_val = _pick(smeta.get('filing_date'), raw.get('filing_date'), case_data.get('filing_date'))
+            j_val = _pick(smeta.get('judgment_date'), raw.get('judgment_date'), case_data.get('judgment_date'))
+            h_val = _pick(smeta.get('hearing_date'), raw.get('hearing_date'), case_data.get('hearing_date'))
             
             import dateparser
             def format_legal_date(val):
                 if not val or str(val).lower() in ["not available", "none", "unknown", "", "n/a"]: 
-                    return "N/A", None
+                     return "N/A", None
                 try:
                     # If it's already a datetime object
                     if hasattr(val, "year"):
@@ -631,8 +762,15 @@ def show_case_details(case_data):
     # --- 7. Statutes & Citations ---
     st.markdown("### 📚 Statutes & Citations")
     with st.container(border=True):
-        statutes = case_data.get('extracted_statutes') or case_data.get('statutes_sections')
-        citations = case_data.get('citations')
+        statutes = smeta.get('statutes') or raw.get('statutes') or case_data.get('extracted_statutes') or case_data.get('statutes_sections')
+        citations = smeta.get('citations') or raw.get('citations') or case_data.get('citations')
+        
+        # Format as string if it is a list
+        if isinstance(statutes, list):
+            statutes = " · ".join(statutes)
+        if isinstance(citations, list):
+            citations = " · ".join(citations)
+            
         st.write(f"**Statutes:** {statutes or 'Not Available'}")
         st.write(f"**Case Citations:** {citations or 'Not Available'}")
 
@@ -645,21 +783,34 @@ def show_case_details(case_data):
     st.markdown("### 🧬 Similar Matter Analysis")
     current_id = case_data.get('case_number')
     
-    # Filter for VALID similar cases only (hide garbage)
-    all_sim = [c for c in all_cases if c.get('case_number') != current_id and c.get('cluster_label') == case_data.get('cluster_label')]
-    similar_cases = []
-    for sc in all_sim:
-        sc_id = sanitize_metadata_field(sc.get('case_number'), 'case_id')
-        sc_title = sanitize_metadata_field(sc.get('title'), 'title')
-        if sc_id != "Not Available" and sc_title != "Not Available":
-            similar_cases.append(sc)
-
-    if similar_cases:
-        st.success(f"Found {len(similar_cases)} cases with high similarity.")
-        for sc in similar_cases[:3]:
-            st.caption(f"• {sc.get('title')} (ID: {sc.get('case_number')})")
+    # 2 & 5. Similarity clustering source: Use ONLY session_uploaded_cases.
+    current_batch = st.session_state.get('current_upload_batch_case_numbers', [])
+    
+    # 7. If only one file uploaded
+    if len(current_batch) <= 1:
+        st.info("No similar uploaded cases available.")
     else:
-        st.info("No high-similarity precedents found in current dataset.")
+        # Filter for VALID similar cases only (hide garbage) AND only those in current batch
+        all_sim = [
+            c for c in all_cases 
+            if c.get('case_number') != current_id 
+            and c.get('cluster_label') == case_data.get('cluster_label') 
+            and c.get('case_number') in current_batch
+        ]
+        
+        similar_cases = []
+        for sc in all_sim:
+            sc_id = sanitize_metadata_field(sc.get('case_number'), 'case_id')
+            sc_title = sanitize_metadata_field(sc.get('title'), 'title')
+            if sc_id != "Not Available" and sc_title != "Not Available":
+                similar_cases.append(sc)
+
+        if similar_cases:
+            st.success(f"Found {len(similar_cases)} cases with high similarity.")
+            for sc in similar_cases[:3]:
+                st.caption(f"• {sc.get('title')} (ID: {sc.get('case_number')})")
+        else:
+            st.info("No high-similarity precedents found in current dataset.")
 
     # --- 10. View Full Case Text ---
     st.markdown("---")
@@ -874,13 +1025,24 @@ elif menu == "📤 Upload & Processing":
         with st.spinner("Extracting intelligence & analyzing legal features..."):
             payload = [("files", (f.name, f.getvalue(), f.type)) for f in files]
             try:
+                # 3 & 4. Before new upload: reset session cache
+                st.session_state.current_upload_batch_case_numbers = []
+                st.session_state.current_upload_batch_db_ids = []
+                st.session_state.current_uploaded_filenames = [f.name for f in files]
+                
                 res = requests.post(f"{API_URL}/upload/bulk", files=payload, timeout=600)
                 if res.status_code == 200:
                     data = res.json()
                     results = data.get('results', [])
                     success = [r for r in results if 'error' not in r]
                     errors  = [r for r in results if 'error' in r]
+                    
+                    # 1 & 4. Maintain session-specific uploaded cases list
                     if success:
+                        st.session_state.current_upload_batch_case_numbers = [r.get('case_number') for r in success if r.get('case_number')]
+                        # Track DB IDs for vector store session isolation
+                        st.session_state.current_upload_batch_db_ids = [str(r.get('case_id')) for r in success if r.get('case_id')]
+                        
                         if len(success) == len(files):
                             st.success(f"✅ Successfully processed ALL {len(success)} document(s).")
                         else:
@@ -1315,82 +1477,639 @@ elif menu == "🧬 Similar Clustering":
 # 5. Precedent Retrieval
 # ────────────────────────────────────────────────────────
 elif menu == "📚 Precedent Intelligence":
-    st.markdown("<h2 class='section-header'>📚 Precedent Retrieval (RAG)</h2>", unsafe_allow_html=True)
-    st.info("Module ready. Select a case from the Registry to view matching historical precedents.")
+    st.markdown("<h2 class='section-header'>📚 Precedent Intelligence (RAG)</h2>", unsafe_allow_html=True)
+    st.markdown("Ask legal questions about uploaded judgments and retrieve grounded answers using vector similarity search.")
+    
+    if not all_cases:
+        st.info("No cases available. Please upload and process documents first in the 'Upload & Processing' tab.")
+    else:
+        # Top Controls
+        case_options = {f"{c.get('case_number')} | {c.get('title')}": c for c in all_cases}
+        selected_case_name = st.selectbox("Select Existing Case", options=list(case_options.keys()))
+        selected_case = case_options[selected_case_name]
+        case_id = selected_case.get("id")
 
+        if case_id:
+            raw = json.loads(selected_case.get('raw_content', '{}')) if selected_case.get('raw_content') else {}
+
+            # Ask Question input with form
+            with st.form("rag_query_form"):
+                qc, bc = st.columns([5, 1])
+                with qc:
+                    prompt = st.text_input("Question", placeholder="Ask about selected case (author, bench, outcome, citations, summary...)", label_visibility="collapsed")
+                with bc:
+                    submit_query = st.form_submit_button("Ask ➤", use_container_width=True)
+            st.caption("Suggested: `author` · `bench` · `summary` · `outcome` · `citations` · `legal issue` · `petitioner` · `respondent` · `judgment date`")
+
+            st.divider()
+
+            # ── SECTION 1: Active Case Overview ──
+            # Read directly from parsed structured_meta (regex-extracted, no vector dependency)
+            smeta = raw.get('structured_meta', {})
+
+            def _pick(*keys_from_dicts):
+                """Try structured_meta first, then raw, returning first non-empty non-NA value."""
+                for val in keys_from_dicts:
+                    if val and str(val).strip().lower() not in ('', 'not available', 'none', 'null', 'nan'):
+                        return str(val).strip()
+                return "Not Available"
+
+            ov_title      = sanitize_metadata_field(_pick(smeta.get('case_title'), raw.get('case_title'), selected_case.get('title')), 'title')
+            ov_petitioner = sanitize_metadata_field(_pick(smeta.get('petitioner'), raw.get('petitioner'), selected_case.get('petitioner')), 'party')
+            ov_respondent = sanitize_metadata_field(_pick(smeta.get('respondent'), raw.get('respondent'), selected_case.get('respondent')), 'party')
+            ov_bench      = sanitize_metadata_field(_pick(smeta.get('bench'), raw.get('bench'), selected_case.get('bench')), 'bench')
+            ov_author     = sanitize_metadata_field(_pick(smeta.get('author_judge'), raw.get('author_judge'), selected_case.get('author_judge')), 'general')
+            ov_outcome    = sanitize_metadata_field(_pick(raw.get('legal_outcome'), selected_case.get('legal_outcome')), 'general')
+            ov_issue      = sanitize_metadata_field(_pick(raw.get('core_legal_issue'), selected_case.get('legal_issue'), selected_case.get('core_legal_issue')), 'general')
+            ov_jdate      = sanitize_metadata_field(_pick(smeta.get('judgment_date'), raw.get('judgment_date'), selected_case.get('judgment_date')), 'general')
+
+            # Citations & Statutes: always from structured_meta (regex) first
+            ov_citations  = smeta.get('citations') or raw.get('citations') or []
+            ov_statutes   = smeta.get('statutes') or raw.get('statutes') or selected_case.get('extracted_statutes') or []
+            if isinstance(ov_citations, str): ov_citations = [c.strip() for c in ov_citations.split(',') if c.strip()]
+            if isinstance(ov_statutes, str):  ov_statutes  = [s.strip() for s in ov_statutes.split(',') if s.strip()]
+
+            st.markdown("#### 📄 Active Case Overview")
+            st.markdown(f"**{ov_title}**")
+            st.markdown("---")
+
+            ov1, ov2 = st.columns(2)
+            with ov1:
+                st.markdown(f"**Legal Issue:** {ov_issue}")
+                st.markdown(f"**Petitioner/Appellant:** {ov_petitioner}")
+                st.markdown(f"**Respondent:** {ov_respondent}")
+                st.markdown(f"**Judgment Date:** {ov_jdate}")
+            with ov2:
+                st.markdown(f"**Final Outcome:** {ov_outcome}")
+                st.markdown(f"**Bench:** {ov_bench}")
+                st.markdown(f"**Author:** {ov_author}")
+
+            if ov_statutes:
+                st.markdown(f"**Key Statutes:** {' · '.join(ov_statutes[:6])}")
+            if ov_citations:
+                st.markdown(f"**Equivalent Citations:** {' · '.join(ov_citations[:5])}")
+
+            st.divider()
+
+            # ── SECTION 2 & 3: Legal Assistant + Supporting Evidence ──
+            if submit_query and prompt:
+                with st.spinner("Analyzing..."):
+                    try:
+                        chat_res = requests.post(
+                            f"{API_URL}/cases/{case_id}/chat",
+                            json={"question": prompt},
+                            timeout=60
+                        )
+                        if chat_res.status_code == 200:
+                            chat_data = chat_res.json()
+                            answer_text = chat_data.get("answer", "Not Available")
+                            evidence_list = chat_data.get("evidence", [])
+                        else:
+                            answer_text = "Error reaching the AI assistant."
+                            evidence_list = []
+                    except Exception as e:
+                        answer_text = f"Error: {e}"
+                        evidence_list = []
+
+                st.markdown("#### 💬 Legal Assistant Answer")
+                st.info(answer_text)
+
+                if evidence_list:
+                    st.markdown("#### 📎 Supporting Extracts")
+                    for ev in evidence_list:
+                        if ev and ev.strip():
+                            st.markdown(f"> *{ev.strip()[:600]}*")
+
+                st.divider()
+
+            # ── SECTION 4: Similar Precedents ──
+            st.markdown("#### 🔍 Similar Precedents")
+            with st.spinner("Retrieving similar cases..."):
+                try:
+                    # Session isolation: only search among current upload batch
+                    session_db_ids = st.session_state.get('current_upload_batch_db_ids', [])
+                    params = {}
+                    if session_db_ids:
+                        params["session_ids"] = ",".join(session_db_ids)
+                    
+                    prec_res = requests.get(f"{API_URL}/cases/{case_id}/precedents", params=params, timeout=10)
+                    if prec_res.status_code == 200:
+                        precedents = prec_res.json().get("precedents", [])
+                        if not precedents:
+                            st.info("No similar precedents found in uploaded cases.")
+                        else:
+                            for idx, p in enumerate(precedents):
+                                meta = p.get('meta', {})
+                                issue = meta.get('core_legal_issue', meta.get('legal_issue', 'Not Available'))
+                                outcome = meta.get('legal_outcome', 'Not Available')
+                                dist = p.get('similarity_score', 1.0)
+                                sim_pct = max(0, int((1.0 - dist) * 100))
+                                st.markdown(f"""
+                                <div style="background:#f8fafc; padding:10px 15px; border-radius:6px; border:1px solid #e2e8f0; border-left:4px solid #3b82f6; margin-bottom:8px;">
+                                    <strong>{idx + 1}. {p.get('title', 'Unknown')}</strong>
+                                    <span style="float:right; background:#dbeafe; color:#1d4ed8; padding:1px 8px; border-radius:10px; font-size:12px;">{sim_pct}% match</span>
+                                    <br><span style="font-size:12px; color:#475569;"><strong>Issue:</strong> {issue}</span>
+                                    <br><span style="font-size:12px; color:#475569;"><strong>Outcome:</strong> {outcome}</span>
+                                </div>
+                                """, unsafe_allow_html=True)
+                    else:
+                        st.error("Failed to retrieve precedents.")
+                except Exception as e:
+                    st.error(f"Error fetching precedents: {e}")
 # ────────────────────────────────────────────────────────
 # 6. Humanitarian Alerts
 # ────────────────────────────────────────────────────────
 elif menu == "🚨 Humanitarian Triage":
-    st.markdown("<h2 class='section-header'>🚨 Humanitarian & Emergency Alerts</h2>", unsafe_allow_html=True)
-    urgent_cases = [c for c in all_cases if c.get('humanitarian_flag') or c.get('urgency_score', 0) >= 80]
-    
-    if not urgent_cases: st.success("No critical humanitarian alerts.")
+    st.markdown("<h2 class='section-header'>🚨 Humanitarian Urgency & Emergency Triage</h2>", unsafe_allow_html=True)
+    st.caption("Identify and prioritize cases requiring immediate human attention due to medical, age, domestic, or personal liberty risks, regardless of standard legal category.")
+
+    if not all_cases:
+        st.info("No cases available for humanitarian triage.")
     else:
-        for c in urgent_cases:
-            st.error(f"**URGENT:** {c.get('title')} (Case {c.get('case_number')}) - Needs immediate attention.")
+        # Precompute triage data for all cases
+        triage_breakdowns = {}
+        for c in all_cases:
+            triage_breakdowns[c.get('id')] = calculate_humanitarian_triage(c)
+            
+        active_triage_cases = [c for c in all_cases if triage_breakdowns[c.get('id')]["is_humanitarian"]]
+        
+        # A. KPI Cards
+        total_hum = len(active_triage_cases)
+        high_risk = len([c for c in active_triage_cases if triage_breakdowns[c.get('id')]["level"] in ["Extreme", "High"]])
+        immediate_action = len([c for c in active_triage_cases if triage_breakdowns[c.get('id')]["score"] > 60])
+
+        st.markdown(f"""
+        <div style='display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-bottom: 25px;'>
+            <div class='metric-card' style='border-left: 5px solid #3b82f6;'>
+                <p style='color:#64748b; font-size:12px; margin:0;'>TOTAL VULNERABLE CASES</p>
+                <h3 style='color:#1e3a8a; font-size:24px; margin:5px 0 0 0;'>{total_hum}</h3>
+            </div>
+            <div class='metric-card' style='border-left: 5px solid #ea580c;'>
+                <p style='color:#64748b; font-size:12px; margin:0;'>HIGH RISK CASES</p>
+                <h3 style='color:#c2410c; font-size:24px; margin:5px 0 0 0;'>{high_risk}</h3>
+            </div>
+            <div class='metric-card' style='border-left: 5px solid #dc2626;'>
+                <p style='color:#64748b; font-size:12px; margin:0;'>IMMEDIATE ACTION NEEDED</p>
+                <h3 style='color:#991b1b; font-size:24px; margin:5px 0 0 0;'>{immediate_action}</h3>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Split layout
+        col_left, col_right = st.columns([7, 3])
+
+        # Prepare Ranked Queue Table Data
+        queue_rows = []
+        sorted_active_cases = sorted(active_triage_cases, key=lambda x: triage_breakdowns[x.get('id')]["score"], reverse=True)
+        
+        for idx, c in enumerate(sorted_active_cases):
+            tb = triage_breakdowns[c.get('id')]
+            
+            # Determine primary vulnerability type based on highest score
+            vuln_type = "Medical" if tb['med_score'] > 0 else "Child/Women" if tb['child_women_score'] > 0 else "Senior Citizen" if tb['senior_score'] > 0 else "Liberty/Shelter"
+            if tb['signals']:
+                vuln_type = tb['signals'][0].split(None, 1)[1] if len(tb['signals'][0].split()) > 1 else tb['signals'][0]
+                
+            queue_rows.append({
+                "Rank": idx + 1,
+                "InternalID": c.get('id'),
+                "Case ID": sanitize_metadata_field(c.get('case_number'), 'case_id'),
+                "Case Title": sanitize_metadata_field(c.get('title'), 'title'),
+                "Risk Score": f"{tb['score']}/100",
+                "Vulnerability Type": vuln_type,
+                "Recommended Action": tb["relief_needed"],
+                "Select": False
+            })
+            
+        df_queue = pd.DataFrame(queue_rows)
+
+        # Handle row selection
+        if 'active_triage_case_id' not in st.session_state:
+            st.session_state.active_triage_case_id = None
+
+        with col_left:
+            st.markdown("### 📋 Ranked Humanitarian Queue")
+            
+            if df_queue.empty:
+                st.info("No cases currently match active humanitarian risk criteria.")
+            else:
+                edited_queue = st.data_editor(
+                    df_queue,
+                    column_config={
+                        "InternalID": None,
+                        "Rank": st.column_config.NumberColumn("Rank", width="small"),
+                        "Select": st.column_config.CheckboxColumn("Select", help="Check to inspect risk breakdown", default=False),
+                    },
+                    disabled=["Rank", "Case ID", "Case Title", "Risk Score", "Vulnerability Type", "Recommended Action"],
+                    hide_index=True,
+                    use_container_width=True,
+                    key="humanitarian_queue_editor"
+                )
+                
+                selected_triage_ids = edited_queue[edited_queue["Select"] == True]["InternalID"].tolist()
+                if selected_triage_ids:
+                    st.session_state.active_triage_case_id = selected_triage_ids[0]
+
+        with col_right:
+            # Determine active selected case
+            active_case_id = st.session_state.active_triage_case_id
+            if not active_case_id and not df_queue.empty:
+                active_case_id = df_queue.iloc[0]["InternalID"]
+                
+            active_case = next((c for c in all_cases if c.get('id') == active_case_id), None)
+
+            if active_case:
+                tb = triage_breakdowns[active_case.get('id')]
+                
+                st.markdown("### 🔍 Case Analysis")
+                st.markdown(f"**{sanitize_metadata_field(active_case.get('case_number'), 'case_id')}**")
+                st.caption(f"{sanitize_metadata_field(active_case.get('title'), 'title')}")
+                
+                r_colors = {"Extreme": "#dc2626", "High": "#ea580c", "Moderate": "#eab308", "Low": "#22c55e"}
+                color = r_colors.get(tb["level"], "#22c55e")
+                
+                st.markdown(f"**Risk Score:** <span style='color:{color}; font-weight:bold;'>{tb['score']}/100</span>", unsafe_allow_html=True)
+                st.markdown(f"**Risk Level:** <span style='color:{color}; font-weight:bold;'>{tb['level']}</span>", unsafe_allow_html=True)
+                
+                # Detected Signals
+                st.markdown("**Detected Signals:**")
+                if tb["signals"]:
+                    badges = "".join([f"<span style='background:#f1f5f9; border:1px solid #cbd5e1; border-radius:4px; padding:2px 8px; font-size:12px; margin-right:5px; display:inline-block;'>{s.split()[0]} {s.split(None, 1)[1] if len(s.split()) > 1 else ''}</span>" for s in tb["signals"]])
+                    st.markdown(badges, unsafe_allow_html=True)
+                else:
+                    st.markdown("<span style='color:#64748b; font-size:12px;'>No specific signals detected.</span>", unsafe_allow_html=True)
+                
+                st.markdown("<br>**Recommended Action:**", unsafe_allow_html=True)
+                st.info(tb["relief_needed"])
+            else:
+                st.info("Select a case in the Ranked Queue to view risk details.")
 
 # ────────────────────────────────────────────────────────
 # 7. Schedule Optimizer
 # ────────────────────────────────────────────────────────
 elif menu == "📅 Schedule Optimizer":
-    st.markdown("<h2 class='section-header'>📅 AI Schedule Optimizer</h2>", unsafe_allow_html=True)
+    st.markdown("<h2 class='section-header'>📅 Court-Style Dynamic Scheduling System</h2>", unsafe_allow_html=True)
+    st.markdown("<p style='color: #64748b;'>Manage hearings, postponements, evidence collection periods, and dynamic queue movement exactly like a real court process.</p>", unsafe_allow_html=True)
     
-    court_date = st.date_input("Target Hearing Date", datetime.now().date())
-    if st.button("Generate Cause List", type="primary"):
-        with st.spinner("Optimizing schedule..."):
-            res = requests.post(f"{API_URL}/schedule/generate", params={"court_date": court_date.isoformat()})
+    if not all_cases:
+        st.info("Ingest cases in the Registry to activate the Judicial Scheduler.")
+    else:
+        import requests
+        from datetime import datetime, timedelta
+        
+        # 1. Fetch simulation date
+        sim_date_str = datetime.utcnow().strftime("%Y-%m-%d")
+        try:
+            res = requests.get(f"{API_URL}/schedule/sim_date", timeout=10)
             if res.status_code == 200:
-                data = res.json()
-                st.success(f"Optimized hearing schedule generated for {data['date']}.")
+                sim_date_str = res.json().get("sim_date", sim_date_str)
+        except Exception as e:
+            st.error(f"Error fetching simulation date: {e}")
+            
+        sim_date = datetime.strptime(sim_date_str, "%Y-%m-%d").date()
+        
+        # 2. Render Simulation Controls
+        st.markdown("### 🎛️ Simulation Controls")
+        c_date, c_btns = st.columns([1, 2])
+        with c_date:
+            st.markdown(f"""
+            <div style='background: #1e293b; padding: 15px; border-radius: 8px; border: 1px solid #334155; text-align: center;'>
+                <span style='color: #94a3b8; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;'>VIRTUAL COURT DATE</span>
+                <h3 style='margin: 5px 0 0 0; color: #3b82f6; font-size: 24px;'>📅 {sim_date_str}</h3>
+            </div>
+            """, unsafe_allow_html=True)
+        with c_btns:
+            st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+            bc1, bc2, bc3, bc4 = st.columns(4)
+            if bc1.button("Advance +1 Day", use_container_width=True):
+                requests.post(f"{API_URL}/schedule/sim_date", json={"days": 1})
+                st.rerun()
+            if bc2.button("Advance +7 Days", use_container_width=True):
+                requests.post(f"{API_URL}/schedule/sim_date", json={"days": 7})
+                st.rerun()
+            if bc3.button("Advance +30 Days", use_container_width=True):
+                requests.post(f"{API_URL}/schedule/sim_date", json={"days": 30})
+                st.rerun()
+            if bc4.button("Reset Today", use_container_width=True):
+                requests.post(f"{API_URL}/schedule/sim_date", json={"days": 0})
+                st.rerun()
                 
-                sched_data = []
-                for h in data['cause_list']:
-                    sched_data.append({
-                        "Date": data['date'],
-                        "Time Slot": h['time_slot'],
-                        "Courtroom": "Court 1", # Mocked
-                        "Judge": h['judge'],
-                        "Cases Assigned": f"{h['title']} ({h['case_number']})",
-                        "Estimated Duration": h['estimated_duration']
+        # 3. Fetch schedule queue
+        queue_cases = []
+        try:
+            q_res = requests.get(f"{API_URL}/schedule/queue", timeout=10)
+            if q_res.status_code == 200:
+                queue_cases = q_res.json()
+        except Exception as e:
+            st.error(f"Error fetching schedule queue: {e}")
+            
+        # 4. Fetch assigned hearings for simulation date
+        slots_hearings = []
+        try:
+            s_res = requests.get(f"{API_URL}/schedule/slots?date_str={sim_date_str}", timeout=10)
+            if s_res.status_code == 200:
+                slots_hearings = s_res.json().get("hearings", [])
+        except Exception as e:
+            st.error(f"Error fetching scheduled slots: {e}")
+            
+        # 5. Form overlays (inline containers) based on state
+        if 'postpone_case_id' not in st.session_state: st.session_state.postpone_case_id = None
+        if 'evidence_case_id' not in st.session_state: st.session_state.evidence_case_id = None
+        if 'schedule_case_id' not in st.session_state: st.session_state.schedule_case_id = None
+        
+        # Determine case details for forms
+        active_form_case = None
+        active_case_id = st.session_state.postpone_case_id or st.session_state.evidence_case_id or st.session_state.schedule_case_id
+        if active_case_id:
+            active_form_case = next((c for c in queue_cases if c["id"] == active_case_id), None)
+            if not active_form_case:
+                active_form_case = next((c for c in slots_hearings if c["id"] == active_case_id), None)
+                
+        if st.session_state.postpone_case_id and active_form_case:
+            with st.container():
+                st.markdown(f"### 🛑 Postpone Hearing: *{active_form_case.get('title')}*")
+                with st.form("postpone_form"):
+                    p_reason = st.selectbox(
+                        "Postponement Reason",
+                        ["Evidence Pending", "Witness Absent", "Investigation Pending", "Advocate Request", "Medical Emergency", "Settlement Discussion", "Court Delay", "Other"]
+                    )
+                    p_date = st.date_input("Postponed Until Date", min_value=sim_date + timedelta(days=1), value=sim_date + timedelta(days=7))
+                    
+                    fc1, fc2 = st.columns(2)
+                    if fc1.form_submit_button("Confirm Adjournment", use_container_width=True):
+                        requests.post(f"{API_URL}/schedule/postpone", json={
+                            "case_id": active_case_id,
+                            "postponed_until": p_date.strftime("%Y-%m-%d"),
+                            "reason": p_reason
+                        })
+                        st.session_state.postpone_case_id = None
+                        st.success("Case successfully postponed!")
+                        st.rerun()
+                    if fc2.form_submit_button("Cancel", use_container_width=True):
+                        st.session_state.postpone_case_id = None
+                        st.rerun()
+                        
+        elif st.session_state.evidence_case_id and active_form_case:
+            with st.container():
+                st.markdown(f"### 📂 Request Evidence & Pause: *{active_form_case.get('title')}*")
+                with st.form("evidence_form"):
+                    e_notes = st.text_area("Evidence Requirements & Pending Items", placeholder="Detail what records, witness statements, or exhibits are required.")
+                    e_date = st.date_input("Evidence Submission Deadline", min_value=sim_date + timedelta(days=1), value=sim_date + timedelta(days=5))
+                    
+                    fc1, fc2 = st.columns(2)
+                    if fc1.form_submit_button("Submit Request & Pause", use_container_width=True):
+                        requests.post(f"{API_URL}/schedule/request_evidence", json={
+                            "case_id": active_case_id,
+                            "evidence_deadline": e_date.strftime("%Y-%m-%d"),
+                            "evidence_notes": e_notes
+                        })
+                        st.session_state.evidence_case_id = None
+                        st.success("Evidence requested and proceedings paused.")
+                        st.rerun()
+                    if fc2.form_submit_button("Cancel", use_container_width=True):
+                        st.session_state.evidence_case_id = None
+                        st.rerun()
+                        
+        elif st.session_state.schedule_case_id and active_form_case:
+            with st.container():
+                st.markdown(f"### 📅 Schedule Hearing Slot: *{active_form_case.get('title')}*")
+                with st.form("schedule_form"):
+                    s_date = st.date_input("Hearing Date", min_value=sim_date, value=sim_date)
+                    s_time = st.selectbox("Hearing Session", ["Morning Session (10 AM - 1 PM)", "Afternoon Session (2 PM - 5 PM)"])
+                    s_room = st.selectbox("Court Room", ["Court Room 1", "Court Room 2", "Chambers"])
+                    s_judge = st.selectbox("Judge / Bench", ["Hon'ble Justice A. Sharma", "Hon'ble Justice B. Verma", "Hon'ble Justice C. Gupta"])
+                    
+                    fc1, fc2 = st.columns(2)
+                    if fc1.form_submit_button("Schedule Hearing", use_container_width=True):
+                        requests.post(f"{API_URL}/schedule/assign_slot", json={
+                            "case_id": active_case_id,
+                            "hearing_date": s_date.strftime("%Y-%m-%d"),
+                            "hearing_time": s_time,
+                            "court_room": s_room,
+                            "judge_name": s_judge
+                        })
+                        st.session_state.schedule_case_id = None
+                        st.success("Hearing successfully scheduled!")
+                        st.rerun()
+                    if fc2.form_submit_button("Cancel", use_container_width=True):
+                        st.session_state.schedule_case_id = None
+                        st.rerun()
+                        
+        # 6. Alerts & Notifications
+        alerts = []
+        for case in queue_cases:
+            if case["is_emergency"] and not case["hearing_date"]:
+                alerts.append({
+                    "type": "danger",
+                    "text": f"🚨 <b>FAST-TRACK EMERGENCY:</b> Case <i>{case['title']}</i> is pending scheduling. Prioritize immediately!"
+                })
+            if case["status"] == "Awaiting Evidence" and case["evidence_deadline"]:
+                dead_date = datetime.strptime(case["evidence_deadline"], "%Y-%m-%d").date()
+                if dead_date <= sim_date:
+                    alerts.append({
+                        "type": "warning",
+                        "text": f"⚠ <b>EVIDENCE OVERDUE:</b> Deadline has passed ({case['evidence_deadline']}) for <i>{case['title']}</i>."
                     })
-                st.dataframe(pd.DataFrame(sched_data), use_container_width=True, hide_index=True)
+                elif (dead_date - sim_date).days <= 3:
+                    alerts.append({
+                        "type": "warning",
+                        "text": f"📅 <b>EVIDENCE DUE SOON:</b> Submission due in {(dead_date - sim_date).days} days for <i>{case['title']}</i>."
+                    })
+            if case["adjournment_count"] >= 3:
+                alerts.append({
+                    "type": "info",
+                    "text": f"🔄 <b>FREQUENT ADJOURNMENTS:</b> Case <i>{case['title']}</i> has been postponed {case['adjournment_count']} times."
+                })
+                
+        if alerts:
+            st.markdown("### 🔔 System Alerts")
+            for a in alerts[:4]:
+                bg_color = "rgba(239, 68, 68, 0.15)" if a["type"] == "danger" else "rgba(245, 158, 11, 0.15)" if a["type"] == "warning" else "rgba(59, 130, 246, 0.15)"
+                border_color = "#ef4444" if a["type"] == "danger" else "#f59e0b" if a["type"] == "warning" else "#3b82f6"
+                st.markdown(f"""
+                <div style='background-color: {bg_color}; border: 1px solid {border_color}; border-left: 5px solid {border_color}; border-radius: 6px; padding: 12px; margin-bottom: 10px; font-size: 13px; color: #e2e8f0;'>
+                    {a['text']}
+                </div>
+                """, unsafe_allow_html=True)
+                
+        st.divider()
+        
+        # 7. Split Layout: Cause List vs Queue Manager
+        col_slots, col_queue = st.columns([1, 1])
+        
+        with col_slots:
+            st.markdown("### 🏛️ Daily Cause List")
+            st.caption(f"Hearings scheduled for {sim_date_str}")
+            
+            sessions = ["Morning Session (10 AM - 1 PM)", "Afternoon Session (2 PM - 5 PM)"]
+            
+            for session in sessions:
+                st.markdown(f"#### 🕒 {session}")
+                matching_hearings = [h for h in slots_hearings if h["hearing_time"] == session]
+                
+                if not matching_hearings:
+                    st.markdown("""
+                    <div style='border: 1px dashed #475569; padding: 20px; border-radius: 8px; text-align: center; color: #64748b; margin-bottom: 15px;'>
+                        No hearing scheduled for this slot.
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    for hearing in matching_hearings:
+                        is_hearing_ready = hearing["is_ready"]
+                        priority_color = "#dc2626" if hearing["priority_level"] == "Critical" else "#ea580c" if hearing["priority_level"] == "High" else "#f59e0b" if hearing["priority_level"] == "Medium" else "#10b981"
+                        
+                        card_status = hearing["status"]
+                        status_style = "background: #1e3a8a; color: #60a5fa;"
+                        if card_status == "In Hearing":
+                            status_style = "background: #064e3b; color: #10b981; border: 1px solid #10b981;"
+                        elif card_status == "Judgment Reserved":
+                            status_style = "background: #78350f; color: #fbbf24;"
+                            
+                        ready_html = "<span style='color: #10b981; font-weight: bold;'>Ready</span>" if is_hearing_ready else "<span style='color: #ef4444; font-weight: bold;'>⚠️ Not Ready</span>"
+                        
+                        st.markdown(f"""
+                        <div style='background: #1e293b; padding: 15px; border-radius: 8px; border-left: 6px solid {priority_color}; border: 1px solid #334155; margin-bottom: 10px;'>
+                            <div style='display: flex; justify-content: space-between; align-items: center;'>
+                                <strong style='font-size: 14px; color: #f1f5f9;'>{hearing['title']}</strong>
+                                <span style='font-size: 11px; padding: 2px 8px; border-radius: 12px; {status_style}'>{card_status}</span>
+                            </div>
+                            <div style='color: #94a3b8; font-size: 12px; margin-top: 5px; line-height: 1.4;'>
+                                <b>Case ID:</b> {hearing['case_number'].split(' | ')[0]}<br>
+                                <b>Judge:</b> {hearing['judge_name']}<br>
+                                <b>Court Room:</b> {hearing['court_room']}<br>
+                                <b>Readiness Status:</b> {ready_html}
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        if not is_hearing_ready:
+                            st.warning("⚠️ Case is not ready for hearing. Verify missing items in the Active Queue.")
+                            
+                        # Actions
+                        ac1, ac2, ac3 = st.columns(3)
+                        if card_status == "Scheduled":
+                            if ac1.button("Start Hearing", key=f"start_{hearing['id']}", use_container_width=True):
+                                requests.post(f"{API_URL}/schedule/update_case_status", json={"case_id": hearing["id"], "status": "In Hearing"})
+                                st.rerun()
+                        elif card_status == "In Hearing":
+                            if ac1.button("Reserve Judgment", key=f"reserve_{hearing['id']}", use_container_width=True):
+                                requests.post(f"{API_URL}/schedule/update_case_status", json={"case_id": hearing["id"], "status": "Judgment Reserved"})
+                                st.rerun()
+                                
+                        if ac2.button("Postpone", key=f"postpone_btn_{hearing['id']}", use_container_width=True):
+                            st.session_state.postpone_case_id = hearing["id"]
+                            st.rerun()
+                            
+                        if ac3.button("Request Evidence", key=f"req_ev_btn_{hearing['id']}", use_container_width=True):
+                            st.session_state.evidence_case_id = hearing["id"]
+                            st.rerun()
+                            
+                        ac4, ac5, ac6 = st.columns(3)
+                        if ac4.button("Mark Resolved", key=f"resolve_btn_{hearing['id']}", use_container_width=True):
+                            requests.post(f"{API_URL}/schedule/update_case_status", json={"case_id": hearing["id"], "status": "Resolved"})
+                            st.success("Case resolved!")
+                            st.rerun()
+                            
+                        if ac5.button("Close Case", key=f"close_btn_{hearing['id']}", use_container_width=True):
+                            requests.post(f"{API_URL}/schedule/update_case_status", json={"case_id": hearing["id"], "status": "Closed"})
+                            st.rerun()
+                            
+                        st.divider()
+                        
+        with col_queue:
+            st.markdown("### 📋 Active Court Queue")
+            st.caption("Eligible cases sorted dynamically by computed priority score.")
+            
+            if not queue_cases:
+                st.info("No active cases in queue.")
+            else:
+                for case in queue_cases:
+                    p_score = calculate_final_priority(case)
+                    status = case["status"]
+                    priority_color = "#dc2626" if case["priority_level"] == "Critical" else "#ea580c" if case["priority_level"] == "High" else "#f59e0b" if case["priority_level"] == "Medium" else "#10b981"
+                    
+                    paused_label = ""
+                    if status == "Adjourned / Postponed":
+                        paused_label = f"<span style='background: #374151; color: #9ca3af; font-size: 11px; padding: 2px 8px; border-radius: 12px; margin-left: 5px;'>PAUSED: Postponed ({case['postponed_until']})</span>"
+                    elif status == "Awaiting Evidence":
+                        paused_label = f"<span style='background: #78350f; color: #fbbf24; font-size: 11px; padding: 2px 8px; border-radius: 12px; margin-left: 5px;'>PAUSED: Awaiting Evidence ({case['evidence_deadline']})</span>"
+                    elif status == "Under Investigation":
+                        paused_label = f"<span style='background: #4c1d95; color: #a78bfa; font-size: 11px; padding: 2px 8px; border-radius: 12px; margin-left: 5px;'>PAUSED: Under Investigation</span>"
+                        
+                    emergency_label = ""
+                    if case["is_emergency"]:
+                        emergency_label = "<span style='background: #991b1b; color: #fecaca; font-size: 11px; padding: 2px 8px; border-radius: 12px; font-weight: bold; margin-left: 5px;'>🚨 FAST-TRACK</span>"
+                        
+                    st.markdown(f"""
+                    <div style='background: #0f172a; padding: 15px; border-radius: 8px; border: 1px solid #1e293b; border-left: 5px solid {priority_color}; margin-bottom: 12px;'>
+                        <div style='display: flex; justify-content: space-between; align-items: flex-start;'>
+                            <strong style='font-size: 14px; color: #f1f5f9;'>{case['title']}</strong>
+                            <span style='background: {priority_color}20; color: {priority_color}; font-size: 11px; font-weight: bold; padding: 1px 6px; border-radius: 4px;'>Score: {p_score:.0f}</span>
+                        </div>
+                        <div style='color: #64748b; font-size: 11px; margin-top: 2px;'>
+                            ID: {case['case_number'].split(' | ')[0]} | Type: {case['case_type']} {emergency_label} {paused_label}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Readiness Checklist
+                    rc1, rc2 = st.columns(2)
+                    with rc1:
+                        new_ev = st.checkbox("Evidence Uploaded", value=case["evidence_uploaded"], key=f"ev_{case['id']}")
+                        new_doc = st.checkbox("Documents Verified", value=case["documents_verified"], key=f"doc_{case['id']}")
+                    with rc2:
+                        new_party = st.checkbox("Parties Notified", value=case["parties_notified"], key=f"party_{case['id']}")
+                        new_inv = st.checkbox("Investigation Done", value=case["investigation_completed"], key=f"inv_{case['id']}")
+                        
+                    if (new_ev != case["evidence_uploaded"] or new_doc != case["documents_verified"] or 
+                        new_party != case["parties_notified"] or new_inv != case["investigation_completed"]):
+                        requests.post(f"{API_URL}/schedule/verify_readiness", json={
+                            "case_id": case["id"],
+                            "evidence_uploaded": new_ev,
+                            "documents_verified": new_doc,
+                            "parties_notified": new_party,
+                            "investigation_completed": new_inv
+                        })
+                        st.rerun()
+                        
+                    # Emergency Overrides
+                    with st.expander("🛠️ Emergency Overrides & Schedule Controls"):
+                        ec1, ec2 = st.columns(2)
+                        with ec1:
+                            over_bail = st.checkbox("Bail Matter", value=case["is_bail_matter"], key=f"bail_{case['id']}")
+                            over_child = st.checkbox("Child Protection", value=case["is_child_protection"], key=f"child_{case['id']}")
+                        with ec2:
+                            over_med = st.checkbox("Medical Emergency", value=case["is_medical_emergency"], key=f"med_{case['id']}")
+                            over_dom = st.checkbox("Domestic Violence", value=case["is_domestic_violence"], key=f"dom_{case['id']}")
+                            
+                        if (over_bail != case["is_bail_matter"] or over_child != case["is_child_protection"] or
+                            over_med != case["is_medical_emergency"] or over_dom != case["is_domestic_violence"]):
+                            requests.post(f"{API_URL}/schedule/emergency_override", json={
+                                "case_id": case["id"],
+                                "is_bail_matter": over_bail,
+                                "is_child_protection": over_child,
+                                "is_medical_emergency": over_med,
+                                "is_domestic_violence": over_dom
+                            })
+                            st.rerun()
+                            
+                        if case["hearing_date"]:
+                            st.info(f"Scheduled for {case['hearing_date']} ({case['hearing_time']})")
+                        else:
+                            if st.button("📅 Schedule Hearing Slot", key=f"sch_btn_{case['id']}", use_container_width=True):
+                                st.session_state.schedule_case_id = case["id"]
+                                st.rerun()
+                                
+                    st.divider()
 
 # ────────────────────────────────────────────────────────
 # 8. Analytics Dashboard
 # ────────────────────────────────────────────────────────
 elif menu == "📊 Analytics Dashboard":
-    st.markdown("<h2 class='section-header'>📊 Judicial Analytics & Backlog Intelligence</h2>", unsafe_allow_html=True)
+    try:
+        from frontend.analytics_dashboard import render_analytics_dashboard
+    except ImportError:
+        from analytics_dashboard import render_analytics_dashboard
     
-    if not all_cases:
-        st.info("Ingest cases to view analytics.")
-    else:
-        # 1. KPI Metrics
-        total = len(all_cases)
-        critical = len([c for c in all_cases if c.get('priority_level') == 'Critical'])
-        avg_backlog = np.mean([c.get('backlog_score', 0) for c in all_cases])
-        
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total Documents", total)
-        c2.metric("Critical Matters", critical, delta=f"{critical} Emergency")
-        c3.metric("Avg Backlog Score", f"{avg_backlog:.1f}%")
-        
-        st.divider()
-        
-        # 2. Visualizations
-        v1, v2 = st.columns(2)
-        
-        with v1:
-            st.markdown("#### Priority Distribution")
-            p_counts = pd.Series([c.get('priority_level', 'Low') for c in all_cases]).value_counts().reset_index()
-            p_counts.columns = ['Priority', 'Count']
-            fig1 = px.pie(p_counts, values='Count', names='Priority', hole=0.4, 
-                         color_discrete_map={'Critical':'#dc2626', 'High':'#ea580c', 'Medium':'#f59e0b', 'Low':'#10b981'})
-            st.plotly_chart(fig1, use_container_width=True)
-            
-        with v2:
-            st.markdown("#### Backlog Age Distribution")
-            ages = [c.get('case_age_days', 0) / 365 for c in all_cases]
-            fig2 = px.histogram(x=ages, labels={'x':'Years Old', 'y':'Count'}, nbins=10, color_discrete_sequence=['#3b82f6'])
-            st.plotly_chart(fig2, use_container_width=True)
+    render_analytics_dashboard(all_cases, API_URL, calculate_final_priority, calculate_humanitarian_triage)
 

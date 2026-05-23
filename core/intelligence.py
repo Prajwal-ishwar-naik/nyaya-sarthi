@@ -64,6 +64,10 @@ class IntelligenceEngine:
         text, method = self._robust_extract_text(file_content, file_name)
         text = self._clean_text(text)
         
+        # STEP 2: Always run structured regex extraction FIRST (pre-embedding, pre-LLM)
+        # These fields are authoritative and are never overridden by LLM output.
+        structured_meta = self._extract_structured_metadata(text)
+        
         if len(text.strip()) < 50:
             extracted = self._fallback_regex_extraction(text)
             return self._ensure_metadata_integrity(extracted, text)
@@ -148,6 +152,23 @@ class IntelligenceEngine:
         # 2. Filename fallback for title
         if not extracted.get("case_title") or "available" in str(extracted.get("case_title")).lower():
             extracted["case_title"] = file_name.replace(".pdf", "").replace("_", " ").title()
+
+        # STEP 3: MERGE structured metadata — regex fields OVERRIDE LLM for accuracy
+        # These are the fields where regex patterns are more reliable than LLM inference.
+        for field in ["author_judge", "bench", "petitioner", "respondent", "court_name"]:
+            if structured_meta.get(field) and structured_meta[field] != "Not Available":
+                extracted[field] = structured_meta[field]
+        
+        # For list fields: regex-extracted values take priority if non-empty
+        if structured_meta.get("citations"):
+            extracted["citations"] = structured_meta["citations"]
+        if structured_meta.get("statutes"):
+            extracted["statutes"] = structured_meta["statutes"]
+        if structured_meta.get("judgment_date") and structured_meta["judgment_date"] != "Not Available":
+            extracted["judgment_date"] = structured_meta["judgment_date"]
+        
+        # Store full structured_meta in extracted for UI access
+        extracted["structured_meta"] = structured_meta
 
         extracted.update({
             "extraction_method": method,
@@ -249,23 +270,355 @@ class IntelligenceEngine:
 
         return "Outcome Pending Review"
 
-    def _fallback_regex_extraction(self, text: str) -> Dict[str, Any]:
-        """Fallback extraction using regex directly from raw text."""
-        data = {
-            "case_title": "", "petitioner": "Not Available", "respondent": "Not Available", "court_name": "Not Available",
-            "case_type_inferred": "Legal Matter", "filing_date": "Not Available", "relief_sought": "Not Available",
-            "core_legal_issue": "Not Available", "acts": [], "sections": [], "citations": [], "summary": "Not Available",
-            "case_number_extracted": "Not Available", "legal_outcome": "Outcome Pending Review", "bench": "Not Available"
-        }
+    def _extract_strict_line_field(self, text: str, patterns: List[str], max_len: int = 100) -> str:
+        """
+        Extracts only text on SAME LINE after the match/colon OR the immediate next non-empty line.
+        """
+        for pat in patterns:
+            match = re.search(re.escape(pat), text, re.IGNORECASE)
+            if not match:
+                pat_no_colon = pat.rstrip(':')
+                match = re.search(r'\b' + re.escape(pat_no_colon) + r'\b', text, re.IGNORECASE)
+            
+            if match:
+                start_idx = match.end()
+                remaining = text[start_idx:]
+                remaining = re.sub(r'^[ \t]*[:\-/=][ \t]*', '', remaining)
+                lines = remaining.split('\n')
+                if not lines:
+                    continue
+                
+                first_line = lines[0].strip()
+                if first_line:
+                    val = first_line
+                else:
+                    val = ""
+                    for line in lines[1:]:
+                        line_stripped = line.strip()
+                        if line_stripped:
+                            val = line_stripped
+                            break
+                
+                val = val.strip()
+                if val:
+                    # Clean common noise sentence-connectors
+                    val = re.split(r'\b(?:and\s+have|and\s+has|and\s+carefully|having|who|which|delivering|speaking|represented|through)\b', val, flags=re.IGNORECASE)[0].strip()
+                    val = val.rstrip(',.;:- ')
+                    if len(val) > max_len:
+                        val = val[:max_len].strip()
+                    if val:
+                        return val
+        return "Not Available"
+
+    def _normalize_judge_name(self, name: str) -> str:
+        """
+        Recursively removes prefixes (Hon'ble, Hon’ble, Honble, Hon, Justice, Mr., Mrs., Shri, Dr.)
+        and suffixes (J., CJ., C.J., J, CJ, Justice) and strips extra whitespace and punctuation.
+        """
+        name = re.sub(r'\s+', ' ', name).strip()
         
-        # Extract Dates Robustly
+        # Prefixes to remove (case-insensitive)
+        prefix_pat = re.compile(
+            r'^\s*(?:Hon\'?ble|Hon’ble|Honble|Hon|Justice|Mr\.?|Mrs\.?|Shri|Dr\.?)\b\s*',
+            re.IGNORECASE
+        )
+        
+        # Suffixes to remove (case-insensitive)
+        suffix_pat = re.compile(
+            r'\s*,\s*(?:J\.?|C\.?J\.?|CJ\.?|Justice)\s*$|\s+\b(?:J\.?|C\.?J\.?|CJ\.?|Justice)\b\s*$',
+            re.IGNORECASE
+        )
+        
+        prev_name = ""
+        while name != prev_name:
+            prev_name = name
+            name = prefix_pat.sub('', name).strip()
+            name = suffix_pat.sub('', name).strip()
+            name = name.strip('.,; -')
+            
+        return name
+
+    def _extract_bench(self, text: str) -> str:
+        # Regex to match Bench/CORAM/PRESENT/BEFORE strictly at start of a line (with optional colon)
+        # or anywhere if followed by a colon.
+        pattern = re.compile(
+            r'(?:^|(?<=\n))\s*(Bench|BENCH|CORAM|PRESENT|BEFORE)\b\s*(?::|$)|'
+            r'\b(Bench|BENCH|CORAM|PRESENT|BEFORE)\b\s*:',
+            re.IGNORECASE
+        )
+        
+        best_match = None
+        best_start = len(text)
+        
+        for match in pattern.finditer(text):
+            if match.start() < best_start:
+                best_start = match.start()
+                best_match = match
+
+        if not best_match:
+            return "Not Available"
+
+        start_idx = best_match.end()
+        remaining = text[start_idx:]
+        lines = remaining.split('\n')
+        if not lines:
+            return "Not Available"
+        
+        first_line = lines[0].strip()
+        first_line = re.sub(r'^[:\-/= \t]+', '', first_line).strip()
+        
+        judge_names = []
+        
+        section_pattern = re.compile(
+            r'^(?:PETITIONER|RESPONDENT|BENCH|CORAM|PRESENT|BEFORE|JUDGES|AUTHOR|JUDGMENT|COURT|CASE|APPELLANT|DEFENDANT|VS\.?|VERSUS|ORDER|CONCLUSION|HELD|PRONOUNCED)\b',
+            re.IGNORECASE
+        )
+        
+        if first_line:
+            parts = [p.strip() for p in re.split(r',', first_line) if p.strip()]
+            for p in parts:
+                norm = self._normalize_judge_name(p)
+                if norm:
+                    judge_names.append(norm)
+            
+            for line in lines[1:6]:
+                line_stripped = line.strip()
+                if not line_stripped:
+                    break
+                if section_pattern.match(line_stripped):
+                    break
+                norm = self._normalize_judge_name(line_stripped)
+                if norm and len(norm) < 60 and not re.search(r'\b(?:the|and|filed|directed|against|under|section|article)\b', line_stripped, re.IGNORECASE):
+                    judge_names.append(norm)
+                else:
+                    break
+        else:
+            for line in lines[1:10]:
+                line_stripped = line.strip()
+                if not line_stripped:
+                    if judge_names:
+                        break
+                    continue
+                
+                if section_pattern.match(line_stripped):
+                    break
+                
+                norm = self._normalize_judge_name(line_stripped)
+                if norm and len(norm) < 60 and not re.search(r'\b(?:the|and|filed|directed|against|under|section|article)\b', line_stripped, re.IGNORECASE):
+                    judge_names.append(norm)
+                else:
+                    break
+                    
+        if judge_names:
+            seen = set()
+            unique_judges = []
+            for j in judge_names:
+                if j.lower() not in seen:
+                    seen.add(j.lower())
+                    unique_judges.append(j)
+            return ", ".join(unique_judges)
+            
+        return "Not Available"
+
+    def _extract_author(self, text: str, bench: str) -> str:
+        # 1. Explicit Author: label
+        author_m = re.search(r'\bAuthor\s*[:\-]\s*([^\n]{3,100})', text, re.IGNORECASE)
+        if author_m:
+            return self._normalize_judge_name(author_m.group(1))
+
+        # 2. JUDGMENT delivers
+        judgment_m = re.search(r'\bJUDGMENT[ \t]+([^\n]{3,100})', text, re.IGNORECASE)
+        if judgment_m:
+            val = judgment_m.group(1).strip()
+            match = re.match(r'^(.*?)(?i),\s*(?:J\.?|C\.?J\.?)', val)
+            if match:
+                return self._normalize_judge_name(match.group(1))
+            else:
+                return self._normalize_judge_name(val)
+
+        # 3. <judge_name>, J. or <judge_name>, CJ.
+        judge_suffix_m = re.search(r'\b([A-Z][a-zA-Z\.\s]{3,60}?,?\s*(?:J\.|C\.?J\.))\b', text)
+        if judge_suffix_m:
+            return self._normalize_judge_name(judge_suffix_m.group(1))
+
+        # 4. Fallback: first judge in Bench
+        if bench and bench != "Not Available":
+            first_judge = bench.split(',')[0].strip()
+            if first_judge:
+                return self._normalize_judge_name(first_judge)
+
+        return "Not Available"
+
+    def _normalize_court_name(self, val: str) -> str:
+        val = re.sub(r'\s+', ' ', val).strip()
+        val = val.strip('.,;:- ')
+        return val
+
+    def _extract_court(self, text: str) -> str:
+        # Split by newline and look at the first 50 non-empty lines
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        top_lines = lines[:50]
+        
+        # 1. First, search each line for exact matches of the three allowed headers (case-insensitive)
+        for line in top_lines:
+            if re.search(r'\bIN\s+THE\s+SUPREME\s+COURT\s+OF\s+INDIA\b', line, re.IGNORECASE):
+                return "Supreme Court of India"
+            if re.search(r'\bIN\s+THE\s+HIGH\s+COURT\s+OF\s+KARNATAKA\b', line, re.IGNORECASE):
+                return "High Court of Karnataka"
+            if re.search(r'\bIN\s+THE\s+HIGH\s+COURT\s+OF\s+ANDHRA\s+PRADESH\b', line, re.IGNORECASE):
+                return "High Court of Andhra Pradesh"
+
+        # 2. Second, look for COURT: pattern (case-insensitive)
+        for line in top_lines:
+            court_label_match = re.search(r'\bCOURT\s*:\s*(.*)', line, re.IGNORECASE)
+            if court_label_match:
+                val = court_label_match.group(1).strip()
+                if val:
+                    return self._normalize_court_name(val)
+
+        return "Not Available"
+
+    def _extract_structured_metadata(self, text: str) -> Dict[str, Any]:
+        """
+        STEP 2: Pre-embedding structured metadata extraction.
+        Runs BEFORE any LLM or vector embedding. Results are authoritative for key fields.
+        Supports all Indian legal document formatting variants.
+        """
+        meta = {
+            "case_title":    "Not Available",
+            "author_judge":  "Not Available",
+            "bench":         "Not Available",
+            "petitioner":    "Not Available",
+            "respondent":    "Not Available",
+            "court_name":    "Not Available",
+            "judgment_date": "Not Available",
+            "citations":     [],
+            "statutes":      [],
+        }
+
+        # 1. Petitioner
+        pet_val = self._extract_strict_line_field(text, ["PETITIONER:", "Petitioner:", "Petitioner/Appellant:", "Appellant:"], max_len=100)
+        if pet_val != "Not Available":
+            meta["petitioner"] = pet_val
+
+        # 2. Respondent
+        resp_val = self._extract_strict_line_field(text, ["RESPONDENT:", "Respondent:", "Defendant:"], max_len=100)
+        if resp_val != "Not Available":
+            meta["respondent"] = resp_val
+            
+        # 3. Court
+        court_val = self._extract_court(text)
+        if court_val != "Not Available":
+            meta["court_name"] = court_val
+
+        # 4. Bench
+        bench_val = self._extract_bench(text)
+        if bench_val != "Not Available":
+            meta["bench"] = bench_val
+
+        # 5. Author
+        author_val = self._extract_author(text, meta["bench"])
+        if author_val != "Not Available":
+            meta["author_judge"] = author_val
+
+        # ── CASE TITLE (from petitioner/respondent or vs pattern) ─────────────────
+        if meta["petitioner"] != "Not Available" and meta["respondent"] != "Not Available":
+            meta["case_title"] = f"{meta['petitioner']} vs {meta['respondent']}"
+        else:
+            vs_match = re.search(
+                r'^([A-Z][^\n]{2,80}?)\s+(?:vs?\.?)\s+([A-Z][^\n]{2,80})',
+                text, re.IGNORECASE | re.MULTILINE
+            )
+            if vs_match:
+                meta["case_title"] = vs_match.group(0).strip()[:200]
+                if meta["petitioner"] == "Not Available":
+                    meta["petitioner"] = vs_match.group(1).strip()
+                if meta["respondent"] == "Not Available":
+                    meta["respondent"] = vs_match.group(2).strip()
+
+        # ── EQUIVALENT CITATIONS ───────────────────────────────────────────
+        cit_m = re.search(
+            r'Equivalent\s+[Cc]itations?\s*:\s*([^\n]{5,400})',
+            text, re.IGNORECASE
+        )
+        if cit_m:
+            meta["citations"] = [c.strip() for c in re.split(r'[,;]', cit_m.group(1)) if c.strip()]
+
+        inline_cits = re.findall(
+            r'\b(?:AIR|SCC|SCR|Cr\.?LJ|All\.?LJ|SCALE|SLT)\s+\d{4}\s+\w+\s+\d+\b',
+            text
+        )
+        if inline_cits:
+            meta["citations"] = list(dict.fromkeys(meta["citations"] + inline_cits))[:15]
+
+        # ── STATUTES / SECTIONS ────────────────────────────────────────────
+        statute_matches = re.findall(
+            r'(?:Section|S\.)\s+\d+(?:\([a-z0-9]+\))?(?:\s+of\s+(?:the\s+)?[A-Z][^,\n]{3,60})?'
+            r'|Article\s+\d+(?:\([a-z0-9]+\))?(?:\s+of\s+(?:the\s+)?[A-Z][^,\n]{3,60})?'
+            r'|[A-Z][a-zA-Z\s]+Act,?\s+\d{4}',
+            text
+        )
+        if statute_matches:
+            seen = []
+            for s in statute_matches:
+                clean = s.strip()
+                if clean and clean not in seen and len(clean) < 120:
+                    seen.append(clean)
+            meta["statutes"] = seen[:20]
+
+        # ── JUDGMENT DATE ──────────────────────────────────────────────────
+        date_patterns = [
+            r'(?:dated?|on)\s+(?:the\s+)?(\d{1,2}(?:st|nd|rd|th)?\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)[,\s]+\d{4})',
+            r'(?:Decided\s+On|Judgment\s+Date|Date\s+of\s+Order)\s*[:\-]\s*(\d{1,2}[-/]\d{1,2}[-/]\d{4}|\d{4}-\d{2}-\d{2})',
+            r'(?:dated?|on)\s+(\d{1,2}[-/]\d{1,2}[-/]\d{4})',
+        ]
+        for dp in date_patterns:
+            dm = re.search(dp, text, re.IGNORECASE)
+            if dm:
+                try:
+                    parsed = dateparser.parse(
+                        dm.group(1).strip(),
+                        settings={'STRICT_PARSING': True, 'REQUIRE_PARTS': ['day', 'month', 'year']}
+                    )
+                    if parsed:
+                        meta["judgment_date"] = parsed.strftime("%Y-%m-%d")
+                        break
+                except Exception:
+                    pass
+
+        return meta
+
+    def _fallback_regex_extraction(self, text: str) -> Dict[str, Any]:
+        """Fallback extraction using regex directly from raw text. Used when LLM is unavailable."""
+        # Start with the structured metadata
+        data = self._extract_structured_metadata(text)
+        court_val = data.get("court_name", "Not Available")
+
+        # Add remaining fields with defaults
+        data.update({
+            "case_type_inferred": "Legal Matter",
+            "filing_date": "Not Available",
+            "relief_sought": "Not Available",
+            "core_legal_issue": "Not Available",
+            "acts": [],
+            "sections": data.get("statutes", []),
+            "summary": "Not Available",
+            "case_number_extracted": "Not Available",
+            "legal_outcome": "Outcome Pending Review",
+            "court_name": court_val if court_val != "Not Available" else self._extract_court(text),
+        })
+
+        # Extract Dates Robustly (filing/hearing)
         robust_dates = self._extract_dates_robustly(text)
-        data.update(robust_dates)
+        data["filing_date"] = robust_dates.get("filing_date", "Not Available")
+        if data["judgment_date"] == "Not Available":
+            data["judgment_date"] = robust_dates.get("judgment_date", "Not Available")
+        data["hearing_date"] = robust_dates.get("hearing_date", "Not Available")
 
         # Extract Outcome
         data["legal_outcome"] = self._extract_legal_outcome(text)
 
-        # Indian Case Patterns: W.P. No. 123 of 2023, etc.
+        # Indian Case Number Patterns: W.P. No. 123 of 2023
         case_patterns = [
             r'(?:Case|W\.P\.|Crl\.A\.|O\.S\.|M\.A\.)\s*No\.?\s*([A-Z0-9\-/]+(?:\s*of\s*\d{4})?)',
             r'(?:No\.?)\s*([A-Z0-9\-/]+\s*of\s*\d{4})',
@@ -276,26 +629,6 @@ class IntelligenceEngine:
             if match:
                 data["case_number_extracted"] = match.group(1).strip()
                 break
-
-        # Petitioner vs Respondent
-        vs_match = re.search(r'([A-Z][^\n]+(?:vs\.?|v\.?|AND ANR|AND OTHERS)[^\n]+)', text, re.IGNORECASE)
-        if vs_match:
-            title_line = vs_match.group(1).strip()
-            data["case_title"] = title_line
-            parts = re.split(r'\b(?:vs\.?|v\.?)\b', title_line, flags=re.IGNORECASE)
-            if len(parts) >= 2:
-                data["petitioner"] = parts[0].strip()
-                data["respondent"] = parts[1].strip()
-
-        # Court Detection
-        court_match = re.search(r'(IN THE[^\n]*COURT[^\n]*)', text, re.IGNORECASE)
-        if court_match:
-            data["court_name"] = court_match.group(1).strip()
-        
-        # Bench Detection
-        bench_match = re.search(r'CORAM:\s*([^\n]+)', text, re.IGNORECASE)
-        if bench_match:
-            data["bench"] = bench_match.group(1).strip()
 
         return data
 
@@ -349,12 +682,54 @@ class IntelligenceEngine:
 
     def _clean_text(self, text: str) -> str:
         """Removes headers, footers, excessive whitespace, and normalize fragments."""
-        # Remove repeated whitespace
-        text = re.sub(r'\s+', ' ', text)
-        # Remove common court headers/footers (regex patterns)
-        text = re.sub(r'Page \d+ of \d+', '', text)
-        text = re.sub(r'Court No\..*?\n', '', text)
-        return text.strip()
+        text = re.sub(r'(?i)page\s+\d+(?:\s+of\s+\d+)?', '', text)
+        text = re.sub(r'(?i)\b\d+\s+of\s+\d+\b', '', text)
+        text = re.sub(r'(?i)court\s+no\s*\.?\s*\d+.*?(?:\n|$)', '', text)
+        text = re.sub(r'(?i)in\s+the\s+court\s+of.*?(?:\n|$)', '', text)
+        
+        lines = []
+        for line in text.split('\n'):
+            line = re.sub(r'[ \t]+', ' ', line).strip()
+            if line:
+                lines.append(line)
+                
+        merged_lines = []
+        for line in lines:
+            if not merged_lines:
+                merged_lines.append(line)
+                continue
+            
+            prev_line = merged_lines[-1]
+            is_prev_fragment = False
+            if prev_line:
+                last_char = prev_line[-1]
+                if last_char in [',', ';', '-', '(']:
+                    is_prev_fragment = True
+                else:
+                    last_word_match = re.search(r'\b(\w+)\s*$', prev_line)
+                    if last_word_match:
+                        last_word = last_word_match.group(1).lower()
+                        if last_word in ['and', 'or', 'of', 'the', 'in', 'to', 'for', 'with', 'by', 'at', 'on', 'from', 'as']:
+                            is_prev_fragment = True
+            
+            is_curr_continuation = False
+            if line:
+                first_char = line[0]
+                if first_char.islower():
+                    is_curr_continuation = True
+                elif not re.match(r'^(?:PETITIONER|RESPONDENT|BENCH|CORAM|JUDGES|AUTHOR|JUDGMENT|COURT|CASE|APPELLANT|DEFENDANT)\b', line, re.IGNORECASE):
+                    if is_prev_fragment and len(prev_line) < 80:
+                        is_curr_continuation = True
+            
+            if is_prev_fragment and is_curr_continuation:
+                merged_lines[-1] = prev_line + " " + line
+            else:
+                merged_lines.append(line)
+                
+        cleaned_text = '\n'.join(merged_lines)
+        cleaned_text = re.sub(r' +', ' ', cleaned_text)
+        cleaned_text = re.sub(r'\n+', '\n', cleaned_text)
+        return cleaned_text.strip()
 
     def _sanitize_field(self, value: Any, field_type: str = "general") -> str:
         """Internal sanitizer to prevent raw text leakage into metadata."""

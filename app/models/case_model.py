@@ -15,6 +15,27 @@ class Case(Base):
     status = Column(String, default="Pending")
     is_active = Column(Boolean, default=True)
     
+    # Scheduling & Readiness Details
+    evidence_notes = Column(Text)
+    evidence_deadline = Column(DateTime)
+    evidence_uploaded = Column(Boolean, default=False)
+    documents_verified = Column(Boolean, default=False)
+    parties_notified = Column(Boolean, default=False)
+    investigation_completed = Column(Boolean, default=False)
+    postponed_until = Column(DateTime)
+    postponement_reason = Column(String)
+    
+    # Emergency Overrides
+    is_bail_matter = Column(Boolean, default=False)
+    is_child_protection = Column(Boolean, default=False)
+    is_medical_emergency = Column(Boolean, default=False)
+    is_domestic_violence = Column(Boolean, default=False)
+    
+    # Assigned Session Details
+    hearing_time = Column(String)
+    court_room = Column(String)
+    judge_name = Column(String)
+    
     # Parties
     petitioner = Column(String)
     respondent = Column(String)

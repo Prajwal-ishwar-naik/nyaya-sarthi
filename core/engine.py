@@ -84,11 +84,88 @@ class EngineRoom:
 
     def search_similar(self, query: str, limit: int = 5):
         embedding = self.get_embeddings([query]).tolist()
+        try:
+            count = self.collection.count()
+            actual_limit = min(limit, max(count, 1))
+        except Exception:
+            actual_limit = limit
         results = self.collection.query(
             query_embeddings=embedding,
-            n_results=limit
+            n_results=actual_limit
         )
         return results
+
+    def search_similar_filtered(self, query: str, limit: int = 5, allowed_ids: List[str] = None):
+        """Search only among vectors with IDs in allowed_ids (session isolation)."""
+        embedding = self.get_embeddings([query]).tolist()
+        
+        if not allowed_ids:
+            return self.search_similar(query, limit)
+
+        # ChromaDB supports `where_document` and `where` filters.
+        # IDs must be filtered via `ids` parameter at get() level, or via where clause.
+        # Most reliable approach: fetch all allowed IDs and rank by similarity manually.
+        try:
+            fetched = self.collection.get(
+                ids=allowed_ids,
+                include=["embeddings", "metadatas", "documents"]
+            )
+        except Exception:
+            return self.search_similar(query, limit)
+
+        if not fetched or not fetched.get("ids"):
+            return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
+
+        q_emb = np.array(embedding[0])
+        stored_embs = np.array(fetched["embeddings"])  # shape: (n, dim)
+
+        # Compute cosine distances
+        norms = np.linalg.norm(stored_embs, axis=1)
+        norms[norms == 0] = 1
+        q_norm = np.linalg.norm(q_emb) or 1
+        similarities = np.dot(stored_embs, q_emb) / (norms * q_norm)
+        distances = 1 - similarities  # cosine distance
+
+        top_k = min(limit, len(fetched["ids"]))
+        top_indices = np.argsort(distances)[:top_k]
+
+        return {
+            "ids": [[fetched["ids"][i] for i in top_indices]],
+            "documents": [[fetched["documents"][i] for i in top_indices]],
+            "metadatas": [[fetched["metadatas"][i] for i in top_indices]],
+            "distances": [[float(distances[i]) for i in top_indices]]
+        }
+
+    def chunk_text(self, text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]:
+        words = text.split()
+        chunks = []
+        for i in range(0, len(words), chunk_size - overlap):
+            chunk = " ".join(words[i:i + chunk_size])
+            if chunk:
+                chunks.append(chunk)
+        return chunks
+
+    def semantic_search_chunks(self, query: str, text: str, top_k: int = 3) -> List[str]:
+        chunks = self.chunk_text(text)
+        if not chunks:
+            return []
+            
+        chunk_embeddings = self.get_embeddings(chunks)
+        query_embedding = self.get_embeddings([query])[0]
+        
+        # Calculate cosine similarity manually using numpy
+        norms_chunks = np.linalg.norm(chunk_embeddings, axis=1)
+        norm_query = np.linalg.norm(query_embedding)
+        
+        # Prevent division by zero
+        norms_chunks[norms_chunks == 0] = 1
+        norm_query = norm_query if norm_query != 0 else 1
+        
+        similarities = np.dot(chunk_embeddings, query_embedding) / (norms_chunks * norm_query)
+        
+        # Get top k indices
+        top_indices = np.argsort(similarities)[::-1][:top_k]
+        return [chunks[i] for i in top_indices]
 
 engine_room = EngineRoom()
 

@@ -74,3 +74,51 @@ async def cluster_pending_cases(db: Session = Depends(get_db)):
         
     return formatted_clusters
 
+from core.research import legal_research
+from pydantic import BaseModel
+
+class ChatRequest(BaseModel):
+    question: str
+
+@router.get("/{case_id}/precedents")
+def get_case_precedents(
+    case_id: int,
+    session_ids: Optional[str] = Query(default=None, description="Comma-separated case IDs from current upload session"),
+    db: Session = Depends(get_db)
+):
+    case = db.query(Case).filter(Case.id == case_id, Case.is_active == True).first()
+    if not case:
+        return {"error": "Case not found"}
+        
+    search_text = case.summary or case.title
+    if not search_text:
+        return {"precedents": []}
+
+    # Parse session_ids filter (session isolation)
+    allowed_ids = None
+    if session_ids:
+        allowed_ids = [sid.strip() for sid in session_ids.split(",") if sid.strip()]
+        # Must have at least 2 cases to find a similar one (exclude self)
+        if len(allowed_ids) <= 1:
+            return {"precedents": []}
+
+    # Get precedents, filtered to current session if provided
+    precedents = legal_research.get_similar_precedents(search_text, limit=6, allowed_case_ids=allowed_ids)
+    # Always exclude the current case itself
+    filtered_precedents = [p for p in precedents if str(p.get("id")) != str(case_id)][:5]
+    
+    return {"precedents": filtered_precedents}
+
+@router.post("/{case_id}/chat")
+async def chat_with_case(case_id: int, request: ChatRequest, db: Session = Depends(get_db)):
+    case = db.query(Case).filter(Case.id == case_id, Case.is_active == True).first()
+    if not case:
+        return {"error": "Case not found"}
+        
+    result = await legal_research.analyze_case_query(
+        case_model=case,
+        query=request.question
+    )
+    
+    return result
+

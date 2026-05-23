@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     LLM_MODEL: str = "llama3"
     HF_MODEL: str = "mistralai/Mistral-7B-Instruct-v0.3"
     GROQ_MODEL: str = "llama-3.1-8b-instant"
-    EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
+    EMBEDDING_MODEL: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     INDIC_EMBEDDING_MODEL: str = "ai4bharat/indic-bert"
 
     class Config:

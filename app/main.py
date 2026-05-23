@@ -9,6 +9,10 @@ from app.routes import (
     analytics_routes
 )
 import os
+# Run migrations before SQLAlchemy initialization to ensure columns exist
+from app.database.migrations import run_db_migrations
+run_db_migrations()
+
 # Create all DB tables
 import app.models.case_model  # noqa: F401
 Base.metadata.create_all(bind=engine)
