@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from app.database.db import get_db
 from app.models.case_model import Case
+from core.priority_engine import compute_priority_score_from_orm, score_to_level
 from datetime import datetime, timedelta
 from typing import List, Optional
 from pydantic import BaseModel
@@ -80,75 +81,20 @@ def set_sim_date(db: Session, new_date: datetime.date):
     db.commit()
 
 def calculate_priority_key(case) -> tuple:
-    # 1. Emergency override flag
+    """
+    Returns a sort key tuple for hearing queue ordering.
+    Uses the centralized priority_engine as the single source of truth.
+    """
     is_emergency = bool(
-        case.humanitarian_flag or
-        case.is_bail_matter or
-        case.is_child_protection or
-        case.is_medical_emergency or
-        case.is_domestic_violence
+        getattr(case, "humanitarian_flag", False) or
+        getattr(case, "is_bail_matter", False) or
+        getattr(case, "is_child_protection", False) or
+        getattr(case, "is_medical_emergency", False) or
+        getattr(case, "is_domestic_violence", False)
     )
-    
-    # 2. Priority score calculation matching calculate_final_priority from frontend
-    age_days = case.case_age_days or 0
-    if not age_days and case.filing_date:
-        try:
-            age_days = (datetime.utcnow() - case.filing_date).days
-        except:
-            pass
-            
-    if age_days > 365 * 15:
-        b = 100.0
-    elif age_days > 365 * 10:
-        b = 90.0
-    elif age_days > 365 * 5:
-        b = 75.0
-    elif age_days > 365 * 3:
-        b = 60.0
-    elif age_days > 365 * 1:
-        b = 40.0
-    else:
-        b = 15.0
-
-    u = 30.0
-    ct = str(case.case_type or '').lower()
-    
-    if case.constitutional_flag or 'constitutional' in ct or 'writ' in ct or 'pil' in ct:
-        u += 25.0
-    elif 'criminal' in ct or 'bail' in ct:
-        u += 20.0
-    elif 'appeal' in ct or 'review' in ct:
-        u += 15.0
-    else:
-        u += 10.0
-        
-    title = str(case.title or '').lower()
-    summary = str(getattr(case, "summary", "") or "").lower()
-    if 'appeal' in title or 'review' in title or 'special leave' in title:
-        u += 10.0
-        
-    inactivity = case.inactivity_days or 0
-    if inactivity > 365:
-        u += 15.0
-    elif inactivity > 180:
-        u += 10.0
-        
-    u = min(u, 100.0)
-
-    h = 0.0
-    hum_keywords = ["elderly", "senior citizen", "medical", "custody", "liberty", "personal liberty", "undertrial", "bail", "juvenile", "widow", "handicap", "disable", "pension"]
-    text_to_search = (title + " " + summary).lower()
-    has_hum_keyword = any(kw in text_to_search for kw in hum_keywords)
-    
-    if case.humanitarian_flag or has_hum_keyword:
-        h = 20.0
-        
-    priority_score = (u * 0.6) + (b * 0.3) + (h * 0.1)
-    priority_score = min(max(priority_score, 0.0), 100.0)
-    
-    # 3. Case Age Days
-    age = case.case_age_days or 0
-    
+    # Single source of truth – delegate to centralized engine
+    priority_score = compute_priority_score_from_orm(case)
+    age = getattr(case, "case_age_days", 0) or 0
     return (is_emergency, priority_score, age)
 
 # ── API Endpoints ──
@@ -185,6 +131,18 @@ def advance_simulation_date(req: SimDateRequest, db: Session = Depends(get_db)):
             case.postponement_reason = None
             resumed_count += 1
             
+    # Recalculate case age and priority scores for all active cases relative to the new simulation date
+    active_cases = db.query(Case).filter(Case.is_active == True).all()
+    for case in active_cases:
+        if case.filing_date:
+            fd = case.filing_date
+            fd_date = fd.date() if hasattr(fd, "date") else fd
+            case.case_age_days = max((new_date - fd_date).days, 0)
+        else:
+            case.case_age_days = 0
+        case.priority_score = compute_priority_score_from_orm(case)
+        case.priority_level = score_to_level(case.priority_score)
+        
     db.commit()
     
     return {

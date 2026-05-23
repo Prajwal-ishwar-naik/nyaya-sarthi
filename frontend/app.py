@@ -148,208 +148,32 @@ def generate_case_pdf(case_data, raw_data):
     return bytes(pdf.output())
 
 # --- SHARED ANALYTICS LOGIC ---
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from core.priority_engine import compute_priority_score, compute_priority_breakdown
+
 def calculate_final_priority(c):
     """
-    Computes priority score dynamically from actual extracted case metadata:
-    - Case age / pending duration
-    - Case category (Criminal vs Civil vs Constitutional)
-    - Humanitarian keywords in case summary/text
-    - Appeal / review status
-    - Inactivity / delays
+    Computes priority score dynamically using the centralized priority engine.
     """
-    # 1. Backlog Factor (based on Case Age / Pending Duration)
-    age_days = c.get('case_age_days', 0) or 0
-    if not age_days and c.get('filing_date'):
-        try:
-            from datetime import datetime
-            fd = c.get('filing_date')
-            if isinstance(fd, str):
-                fd = datetime.fromisoformat(fd.replace("Z", ""))
-            elif isinstance(fd, datetime):
-                pass
-            else:
-                fd = None
-            if fd:
-                age_days = (datetime.now() - fd).days
-        except:
-            pass
-            
-    if age_days > 365 * 15:
-        b = 100.0
-    elif age_days > 365 * 10:
-        b = 90.0
-    elif age_days > 365 * 5:
-        b = 75.0
-    elif age_days > 365 * 3:
-        b = 60.0
-    elif age_days > 365 * 1:
-        b = 40.0
-    else:
-        b = 15.0
-
-    # 2. Urgency Factor
-    u = 30.0
-    ct = str(c.get('case_type', '')).lower()
-    
-    if c.get('constitutional_flag') or 'constitutional' in ct or 'writ' in ct or 'pil' in ct:
-        u += 25.0
-    elif 'criminal' in ct or 'bail' in ct:
-        u += 20.0
-    elif 'appeal' in ct or 'review' in ct:
-        u += 15.0
-    else:
-        u += 10.0
-        
-    title = str(c.get('title', '')).lower()
-    summary = str(c.get('summary', '')).lower()
-    if 'appeal' in title or 'review' in title or 'special leave' in title:
-        u += 10.0
-        
-    inactivity = c.get('inactivity_days', 0) or 0
-    if inactivity > 365:
-        u += 15.0
-    elif inactivity > 180:
-        u += 10.0
-        
-    u = min(u, 100.0)
-
-    # 3. Humanitarian Boost
-    h = 0.0
-    hum_keywords = ["elderly", "senior citizen", "medical", "custody", "liberty", "personal liberty", "undertrial", "bail", "juvenile", "widow", "handicap", "disable", "pension"]
-    text_to_search = (title + " " + summary).lower()
-    has_hum_keyword = any(kw in text_to_search for kw in hum_keywords)
-    
-    if c.get('humanitarian_flag') or has_hum_keyword:
-        h = 20.0
-        
-    # Weightings: 60% Urgency, 30% Backlog, 10% Humanitarian
-    score = (u * 0.6) + (b * 0.3) + (h * 0.1)
-    return min(max(score, 0), 100)
+    return compute_priority_score(c)
 
 def get_priority_breakdown(c):
     """
-    Computes case priority components dynamically from metadata for explanation panels.
+    Computes case priority components dynamically for explanation panels
+    delegating to the centralized priority engine.
     """
-    # 1. Backlog Factor (based on Case Age / Pending Duration)
-    age_days = c.get('case_age_days', 0) or 0
-    if not age_days and c.get('filing_date'):
-        try:
-            from datetime import datetime
-            fd = c.get('filing_date')
-            if isinstance(fd, str):
-                fd = datetime.fromisoformat(fd.replace("Z", ""))
-            elif isinstance(fd, datetime):
-                pass
-            else:
-                fd = None
-            if fd:
-                age_days = (datetime.now() - fd).days
-        except:
-            pass
-            
-    if age_days > 365 * 15:
-        b = 100.0
-        age_str = f"{age_days // 365} years old"
-    elif age_days > 365 * 10:
-        b = 90.0
-        age_str = f"{age_days // 365} years old"
-    elif age_days > 365 * 5:
-        b = 75.0
-        age_str = f"{age_days // 365} years old"
-    elif age_days > 365 * 3:
-        b = 60.0
-        age_str = f"{age_days // 365} years old"
-    elif age_days > 365 * 1:
-        b = 40.0
-        age_str = "over 1 year old"
-    else:
-        b = 15.0
-        age_str = f"{age_days} days old"
-
-    # 2. Urgency Factor
-    u = 30.0
-    ct = str(c.get('case_type', '')).lower()
-    ct_name = c.get('case_type') or "Unspecified"
-    
-    if c.get('constitutional_flag') or 'constitutional' in ct or 'writ' in ct or 'pil' in ct:
-        u += 25.0
-        cat_desc = "constitutional/writ status"
-    elif 'criminal' in ct or 'bail' in ct:
-        u += 20.0
-        cat_desc = "criminal appeal"
-    elif 'appeal' in ct or 'review' in ct:
-        u += 15.0
-        cat_desc = "appeal/review"
-    else:
-        u += 10.0
-        cat_desc = f"{ct_name}"
-        
-    title = str(c.get('title', '')).lower()
-    summary = str(c.get('summary', '')).lower()
-    has_appeal = 'appeal' in title or 'review' in title or 'special leave' in title
-    if has_appeal:
-        u += 10.0
-        
-    inactivity = c.get('inactivity_days', 0) or 0
-    if inactivity > 365:
-        u += 15.0
-    elif inactivity > 180:
-        u += 10.0
-        
-    u = min(u, 100.0)
-
-    # 3. Humanitarian Boost
-    h = 0.0
-    hum_keywords = ["elderly", "senior citizen", "medical", "custody", "liberty", "personal liberty", "undertrial", "bail", "juvenile", "widow", "handicap", "disable", "pension"]
-    text_to_search = (title + " " + summary).lower()
-    found_kws = [kw for kw in hum_keywords if kw in text_to_search]
-    
-    if c.get('humanitarian_flag') or found_kws:
-        h = 20.0
-        
-    score = (u * 0.6) + (b * 0.3) + (h * 0.1)
-    score = min(max(score, 0), 100)
-    
-    # Determine level
-    if score >= 60:
-        level = "High"
-    elif score >= 40:
-        level = "Medium"
-    else:
-        level = "Low"
-        
-    # Build explanation sentence
-    reasons = []
-    if age_days > 0:
-        years = age_days // 365
-        if years > 0:
-            reasons.append(f"case is {years} years old")
-        else:
-            reasons.append(f"case is {age_days} days old")
-    if 'criminal' in ct:
-        reasons.append("criminal appeal")
-    elif c.get('constitutional_flag') or 'constitutional' in ct or 'writ' in ct:
-        reasons.append("constitutional/writ status")
-    if found_kws:
-        reasons.append(f"contains humanitarian concern keywords ('{found_kws[0]}')")
-    elif c.get('humanitarian_flag'):
-        reasons.append("contains humanitarian concern keywords")
-        
-    if not reasons:
-        explanation = f"Routine {ct_name} case with standard priority."
-    else:
-        explanation = f"High score because " + ", ".join(reasons) + "."
-        explanation = explanation[0].upper() + explanation[1:]
-        
+    bd = compute_priority_breakdown(c)
     return {
-        "score": score,
-        "urgency_factor": u,
-        "backlog_factor": b,
-        "humanitarian_boost": h,
-        "level": level,
-        "explanation": explanation,
-        "age_days": age_days,
-        "age_str": age_str
+        "score": bd["score"],
+        "urgency_factor": bd["urgency"],
+        "backlog_factor": bd["backlog"],
+        "humanitarian_boost": bd["humanitarian"],
+        "level": bd["level"],
+        "explanation": bd["explanation"],
+        "age_days": bd["age_days"],
+        "age_str": bd["age_label"]
     }
 def calculate_complexity_impact(c):
     """

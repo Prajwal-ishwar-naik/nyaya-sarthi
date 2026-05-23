@@ -45,6 +45,7 @@ class Case(Base):
     # Urgency & Triage
     urgency_score = Column(Float, default=0.0)
     backlog_score = Column(Float, default=0.0)
+    priority_score = Column(Float, default=0.0)   # MASTER UNIFIED SCORE (0–100)
     priority_level = Column(String, default="Low") # Critical, High, Medium, Low
     confidence_score = Column(Float, default=0.0)
     reasoning = Column(Text)

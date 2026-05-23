@@ -31,7 +31,9 @@ def run_db_migrations():
         "is_domestic_violence": "BOOLEAN DEFAULT 0",
         "hearing_time": "TEXT",
         "court_room": "TEXT",
-        "judge_name": "TEXT"
+        "judge_name": "TEXT",
+        # ── Unified Priority Score (master score 0-100) ──
+        "priority_score": "REAL DEFAULT 0.0",
     }
     
     for col, col_type in new_cols.items():

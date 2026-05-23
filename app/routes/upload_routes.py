@@ -4,6 +4,7 @@ from app.database.db import get_db
 from app.models.case_model import Case, Document
 from core.intelligence import intelligence_engine
 from core.analytics import analytics_engine
+from core.priority_engine import compute_priority_score_from_orm, score_to_level
 from core.engine import engine_room
 from typing import List, Optional
 import uuid
@@ -11,6 +12,16 @@ import json
 from datetime import datetime
 
 router = APIRouter()
+
+def _serialize_bench(value) -> str:
+    """Coerce bench (list | str | None) to a plain comma-separated string for SQLite."""
+    if value is None:
+        return "Not Available"
+    if isinstance(value, list):
+        cleaned = [str(v).strip() for v in value if str(v).strip()]
+        return ", ".join(cleaned) if cleaned else "Not Available"
+    s = str(value).strip()
+    return s if s else "Not Available"
 
 @router.post("/")
 async def upload_document(
@@ -42,7 +53,7 @@ async def upload_document(
         # Update existing record
         existing_case.title = extracted_data.get("case_title")
         existing_case.court_name = extracted_data.get("court_name")
-        existing_case.bench = extracted_data.get("bench", "Not Available")
+        existing_case.bench = _serialize_bench(extracted_data.get("bench"))
         existing_case.case_type = case_type
         existing_case.petitioner = extracted_data.get("petitioner")
         existing_case.respondent = extracted_data.get("respondent")
@@ -57,12 +68,14 @@ async def upload_document(
         existing_case.extraction_method = extracted_data.get("extraction_method")
         existing_case.status = "Processed"
         case_to_save = existing_case
+        # Unified priority score – computed after all fields are set
+        existing_case.priority_score = compute_priority_score_from_orm(existing_case)
     else:
         new_case = Case(
             case_number=case_number,
             title=extracted_data.get("case_title"),
             court_name=extracted_data.get("court_name"),
-            bench=extracted_data.get("bench", "Not Available"),
+            bench=_serialize_bench(extracted_data.get("bench")),
             case_type=case_type,
             petitioner=extracted_data.get("petitioner"),
             respondent=extracted_data.get("respondent"),
@@ -85,6 +98,8 @@ async def upload_document(
         )
         db.add(new_case)
         case_to_save = new_case
+        # Unified priority score – computed after all fields are set on the ORM object
+        new_case.priority_score = compute_priority_score_from_orm(new_case)
 
     # Handle Dates & Case Age
     from dateutil.relativedelta import relativedelta
@@ -106,11 +121,15 @@ async def upload_document(
             setattr(case_to_save, k, None)
 
     # Compute Precise Case Age
+    from app.routes.schedule_routes import get_sim_date
+    sim_date = get_sim_date(db)
+    sim_datetime = datetime(sim_date.year, sim_date.month, sim_date.day)
+
     base_date = parsed_dates.get("filing_date")
     if base_date:
-        diff = relativedelta(datetime.utcnow(), base_date)
+        diff = relativedelta(sim_datetime, base_date)
         age_str = f"{diff.years} years, {diff.months} months, {diff.days} days"
-        case_to_save.case_age_days = (datetime.utcnow() - base_date).days
+        case_to_save.case_age_days = max((sim_datetime - base_date).days, 0)
         extracted_data["formatted_age"] = age_str
     else:
         case_to_save.case_age_days = 0
@@ -181,7 +200,7 @@ async def upload_bulk_documents(
                 # Update existing record
                 existing_case.title = extracted_data.get("case_title")
                 existing_case.court_name = extracted_data.get("court_name")
-                existing_case.bench = extracted_data.get("bench", "Not Available")
+                existing_case.bench = _serialize_bench(extracted_data.get("bench"))
                 existing_case.case_type = case_type
                 existing_case.petitioner = extracted_data.get("petitioner")
                 existing_case.respondent = extracted_data.get("respondent")
@@ -196,12 +215,13 @@ async def upload_bulk_documents(
                 existing_case.extraction_method = extracted_data.get("extraction_method")
                 existing_case.status = "Processed"
                 case_to_save = existing_case
+                existing_case.priority_score = compute_priority_score_from_orm(existing_case)
             else:
                 new_case = Case(
                     case_number=case_number,
                     title=extracted_data.get("case_title"),
                     court_name=extracted_data.get("court_name"),
-                    bench=extracted_data.get("bench", "Not Available"),
+                    bench=_serialize_bench(extracted_data.get("bench")),
                     case_type=case_type,
                     petitioner=extracted_data.get("petitioner"),
                     respondent=extracted_data.get("respondent"),
@@ -224,6 +244,7 @@ async def upload_bulk_documents(
                 )
                 db.add(new_case)
                 case_to_save = new_case
+                new_case.priority_score = compute_priority_score_from_orm(new_case)
 
             # Handle Dates & Case Age
             from dateutil.relativedelta import relativedelta
@@ -248,11 +269,15 @@ async def upload_bulk_documents(
 
             # Compute Precise Case Age
             # Strictly use Filing Date ONLY as per rules
+            from app.routes.schedule_routes import get_sim_date
+            sim_date = get_sim_date(db)
+            sim_datetime = datetime(sim_date.year, sim_date.month, sim_date.day)
+
             base_date = parsed_dates.get("filing_date")
             if base_date:
-                diff = relativedelta(datetime.utcnow(), base_date)
+                diff = relativedelta(sim_datetime, base_date)
                 age_str = f"{diff.years} years, {diff.months} months, {diff.days} days"
-                case_to_save.case_age_days = (datetime.utcnow() - base_date).days # Keep days for sorting
+                case_to_save.case_age_days = max((sim_datetime - base_date).days, 0) # Keep days for sorting
                 # Store the formatted string in a temporary attribute or metadata
                 extracted_data["formatted_age"] = age_str
             else:
@@ -348,7 +373,7 @@ async def reprocess_case(case_id: int, db: Session = Depends(get_db)):
         # 4. Update Database Record
         case.title = extracted_data.get("case_title")
         case.court_name = extracted_data.get("court_name")
-        case.bench = extracted_data.get("bench", "Not Available")
+        case.bench = _serialize_bench(extracted_data.get("bench"))
         case.case_type = case_type
         case.petitioner = extracted_data.get("petitioner")
         case.respondent = extracted_data.get("respondent")
@@ -364,10 +389,15 @@ async def reprocess_case(case_id: int, db: Session = Depends(get_db)):
                 parsed = dateparser.parse(str(val))
                 if parsed: setattr(case, date_key, parsed)
         
-        # Re-calculate case age if dates changed
-        all_dates = [d for d in [case.filing_date, case.judgment_date, case.hearing_date] if d]
-        if all_dates:
-            case.case_age_days = (datetime.utcnow() - min(all_dates)).days
+        # Re-calculate case age if dates changed relative to active simulated date
+        from app.routes.schedule_routes import get_sim_date
+        sim_date = get_sim_date(db)
+        sim_datetime = datetime(sim_date.year, sim_date.month, sim_date.day)
+
+        if case.filing_date:
+            case.case_age_days = max((sim_datetime - case.filing_date).days, 0)
+        else:
+            case.case_age_days = 0
 
         case.urgency_score = priority_data["urgency"]
         case.backlog_score = priority_data["backlog"]
@@ -378,6 +408,8 @@ async def reprocess_case(case_id: int, db: Session = Depends(get_db)):
         case.extracted_statutes = json.dumps(extracted_data.get("acts", []) + extracted_data.get("sections", []))
         case.citations = json.dumps(extracted_data.get("citations", []))
         case.raw_content = json.dumps(extracted_data)
+        # Refresh the unified priority score after all fields updated
+        case.priority_score = compute_priority_score_from_orm(case)
         
         db.commit()
         return {"status": "success", "message": f"Successfully reprocessed case: {case.title}"}

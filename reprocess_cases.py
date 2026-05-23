@@ -52,6 +52,8 @@ async def reprocess_all():
             c.legal_issue = extracted.get("core_legal_issue")
             c.relief_sought = extracted.get("relief_sought")
             c.urgency_score = priority_data["urgency"]
+            c.backlog_score = priority_data["backlog"]
+            c.priority_score = priority_data["score"]
             c.priority_level = priority_data["level"]
             c.reasoning = priority_data["explanation"]
             c.raw_content = json.dumps(extracted)
